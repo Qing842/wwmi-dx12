@@ -126,10 +126,13 @@ bool IsNonBlendableDxgiFormat(DXGI_FORMAT fmt)
     }
 }
 
+// In deferred GBuffer MRT passes (rtf_count >= 4), only blend rt0 (BaseColor). Leaving rt1..rt3 unblended
+// preserves unit-length normals and discrete ShadingModelID/Subsurface IDs while still writing valid
+// GBuffer data for sheer clothing over background pixels.
 bool RtBlendBlocked(int rt, const format* rtf, uint32_t rtf_count)
 {
     return rt >= (int)rtf_count ||
-        (rtf && (IsNonBlendableDxgiFormat((DXGI_FORMAT)rtf[rt]) || (rtf_count >= 4 && rt >= 4)));
+        (rtf && (IsNonBlendableDxgiFormat((DXGI_FORMAT)rtf[rt]) || (rtf_count >= 4 && rt >= 1)));
 }
 
 int FindSubobject(const std::vector<pipeline_subobject>& subs, pipeline_subobject_type t)

@@ -42,7 +42,8 @@ struct IndexBind {
     ID3D12Resource* res = nullptr; // IB resource (frame-dump capture needs the object, not just the VA)
 };
 
-constexpr unsigned kSectionTexRegs = 9; // ps-t0..t8: the game's textures a component section sees
+constexpr unsigned kSectionTexRegs = 16; // ps-t0..t15: the game's textures a component section sees
+constexpr unsigned kSectionNullStampRegs = 9; // limit null-SRV stamping to ps-t0..t8 so high lighting slots stay untouched
 
 // Per list: where the last character draw that read each of those registers found its texture (draw_sectex.cpp
 // CarryPsReads), and the root signature, of which recording, the registers' places were taken from.

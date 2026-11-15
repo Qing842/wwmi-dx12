@@ -93,7 +93,8 @@ void SectionPsStamper::PlanStamps(SectionPsStamps& out, device* dev, const RootP
             g_mod_textures.Touch(index);
             stored = index >= 0;
         } else {
-            if (r >= kSectionTexRegs || !g_draw_toggles.ps_slot_stamp_nulls || g_tex_defer.Pending(dm) ||
+            // Limit null-SRV stamping to ps-t0..t8 so high lighting/cube slots (ps-t9+) stay untouched.
+            if (r >= kSectionNullStampRegs || !g_draw_toggles.ps_slot_stamp_nulls || g_tex_defer.Pending(dm) ||
                 PortApi::BoundLoading())
                 continue;
             src = g_stamps.NullSrv(g_addon.d3d12_device, ps_regs.parsed ? ps_regs.kind[r] : 0);
