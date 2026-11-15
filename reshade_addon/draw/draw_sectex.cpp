@@ -156,7 +156,8 @@ uint16_t SectionTexturePublisher::PublishCarried(
         }
         const bool recalled = !listed && carry_memo_.Recall(key, ct);
         if (listed || recalled) {
-            PortApi::PushGameTexture('p', r, ct.res, ct.hash, ct.fmt);
+            const uint32_t pub_hash = (recalled && g_frame_id - ct.frame > 1u) ? 0u : ct.hash;
+            PortApi::PushGameTexture('p', r, ct.res, pub_hash, ct.fmt);
             carried |= (uint16_t)(1u << r);
         }
         if (recalled) ct.res->Release();
@@ -403,5 +404,29 @@ void SectionTexturePublisher::NoteMeshPlaces(const DrawArgs& da)
             else
                 g_tex_look.AtMeshPlace(
                     place, resident, PortApi::TextureHashHasSections(resident) ? resident : g_tex_lod.Known(resident));
+        });
+}
+
+void SectionTexturePublisher::DispatchAuxTextures(const DrawArgs& da)
+{
+    command_list* const cmd_list = da.cmd_list;
+    const DxilSrvRegs ps_regs = g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p');
+    if (ps_regs.parsed && !ps_regs.unbounded && !ps_regs.lo) return;
+    ForEachPsTexture(
+        cmd_list, false, ps_regs, [](unsigned) { return true; },
+        [&](const PsTexture& t) {
+            const uint32_t resident = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(t.ri.res));
+            if (!resident) return;
+            const uint32_t lod =
+                PortApi::TextureHashHasSections(resident) ? resident : g_tex_select.LodTargetOf(resident);
+            const uint32_t hash = lod && PortApi::TextureHashHasSections(lod) ? lod : 0u;
+            if (!hash) return;
+            if (g_recognition.ModelHashAny()) g_recognition.NoteModelDrawn(hash);
+            PortApi::DrawInfo di;
+            di.first_index = da.first_index;
+            di.index_count = da.index_count;
+            di.instance_count = da.instance_count;
+            di.is_pixel_shader = true;
+            PortApi::DispatchTextureOverride(hash, &di);
         });
 }

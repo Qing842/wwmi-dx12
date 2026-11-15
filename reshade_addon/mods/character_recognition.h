@@ -80,6 +80,10 @@ public:
     void SetModelHashes(std::shared_ptr<const std::unordered_set<uint32_t>> hashes);
     void NoteModelDrawn(uint32_t hash);
     void ModelsDrawnWithin(uint32_t frames, std::unordered_set<uint32_t>& out);
+    // True while any loaded GeoMod has a non-component-hash [TextureOverride] whose hash is not a texture rule
+    // (unclaimed draws check their PS textures for these auxiliary/special-form triggers).
+    bool AuxTriggerArmed() const { return aux_trig_armed_.load(std::memory_order_relaxed); }
+    void SetAuxTriggerArmed(bool armed) { aux_trig_armed_.store(armed, std::memory_order_relaxed); }
 
     // The engine's skinned-vertex VA pool band, anchored on the learned VB0s every present.
     bool InSkinBand(uint64_t va) const { return va >= skin_band_lo_.load() && va < skin_band_hi_.load(); }
@@ -152,6 +156,7 @@ private:
     std::unordered_map<uint32_t, uint32_t> model_drawn_; // hash -> the frame an unclaimed draw of it was seen
     std::atomic<bool> model_any_{ false };
     std::atomic<uint32_t> model_gen_{ 0 }; // bumped with each new set, under model_mutex_
+    std::atomic<bool> aux_trig_armed_{ false };
     std::atomic<uint64_t> skin_band_lo_{ 0x1000000000ULL };
     std::atomic<uint64_t> skin_band_hi_{ 0x1100000000ULL };
     std::mutex skincache_mutex_; // char_skin_cs_, skincache_out_ and char_bone_va_

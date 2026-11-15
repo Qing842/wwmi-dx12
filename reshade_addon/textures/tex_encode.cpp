@@ -101,7 +101,7 @@ void TexEncoder::Build(ID3D12Device* dev)
     }
     if (SUCCEEDED(hr)) hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
     if (SUCCEEDED(hr)) {
-        err_ = MakeBuffer(dev, D3D12_HEAP_TYPE_DEFAULT, kErrBytes, D3D12_RESOURCE_STATE_COMMON,
+        err_ = MakeBuffer(dev, D3D12_HEAP_TYPE_DEFAULT, kErrBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         if (!err_) hr = E_OUTOFMEMORY;
     }
@@ -192,6 +192,12 @@ uint64_t TexEncoder::Submit(ID3D12Device* dev, ID3D12CommandQueue* queue, std::v
         if (!MigotoPort::ShaderVisibleCopy(cpu, &gpu, nullptr, f.cl.Get())) continue;
         const uint32_t consts[8] = { bx, by, pitch, 0, sd.Format == DXGI_FORMAT_BC7_UNORM_SRGB ? 1u : 0u, s.shift, 0,
             0 };
+        if (!copy_of.empty()) {
+            D3D12_RESOURCE_BARRIER uav{};
+            uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav.UAV.pResource = err_.Get();
+            f.cl->ResourceBarrier(1, &uav);
+        }
         f.cl->SetComputeRoot32BitConstants(0, 8, consts, 0);
         f.cl->SetComputeRootDescriptorTable(1, gpu);
         f.cl->SetComputeRootUnorderedAccessView(2, blocks->GetGPUVirtualAddress());

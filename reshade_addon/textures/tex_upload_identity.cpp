@@ -191,7 +191,7 @@ void TexUploadIdentity::HashFromUpload(ID3D12Resource* dest, const uint8_t* src,
     }
     DumpIfDegenerate(crc, tight, L, fmt, 0, 0);
     const TexRules& tr = g_tex_rules.Now();
-    bool tex_is_target = tr.hash_to_rule.count(crc) != 0;
+    bool tex_is_target = tr.hash_to_rule.count(crc) != 0 || PortApi::TextureHashHasSections(crc);
     g_tex_look_worker.Queue(dest, crc, w, h, fmt, tex_is_target, tight);
     if (tex_is_target || tr.targets.count(crc) || g_tex_lod.Known(crc) || g_tex_lod.Lookup(crc))
         g_tex_identity.NoteModTex(reinterpret_cast<uint64_t>(dest));

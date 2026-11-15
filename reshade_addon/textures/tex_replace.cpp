@@ -18,7 +18,7 @@ TexReplace g_tex_replace;
 
 namespace {
 constexpr uint64_t kPendingCap = 1024ull << 20; // bytes loaded and not yet swapped in before the loader waits
-constexpr uint32_t kSrvQuarantineFrames = 8;
+constexpr uint32_t kSrvQuarantineFrames = 16;
 constexpr uint32_t kRetireReportFrames = 600;
 constexpr auto kStressEvery = std::chrono::seconds(2);
 constexpr double kEncodeReadPerFrame = 256e6; // source texels a frame's re-encodes may read

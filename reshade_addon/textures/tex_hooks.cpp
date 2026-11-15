@@ -11,6 +11,7 @@
 #include "tex_slot_log.h"
 #include "tex_lineage.h"
 #include "tex_crawl.h"
+#include "../migoto/port_api.h"
 #include "../mods/ib_hash.h" // ForgetRange: a whole-buffer copy replaces the mesh hashes inside it
 #include "../mods/mod_set.h"
 #include "../instrumentation/removal_pin.h"
@@ -204,7 +205,10 @@ bool on_copy_buffer_to_texture(command_list* cl, resource source, uint64_t sourc
     if (dest_subresource != 0) {
         // Only a target's mips are worth a map: a known mip0 that is no rule hash and no alias is nothing.
         const uint32_t h0 = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(dst));
-        if (h0 && !g_tex_select.RuleHashFor(h0) && !g_tex_crawl.On()) return false;
+        const uint32_t lod = h0 ? g_tex_select.LodTargetOf(h0) : 0u;
+        if (h0 && !g_tex_select.RuleHashFor(h0) && !PortApi::TextureHashHasSections(h0) &&
+            !(lod && PortApi::TextureHashHasSections(lod)) && !g_tex_crawl.On())
+            return false;
     }
     const uint64_t span = (uint64_t)L.pitch * (L.rows - 1) + L.tight_row;
     std::atomic<uint32_t>& arrivals = dest_subresource == 0 ? g_tex_stats.ts_buf_mip0 : g_tex_stats.ts_buf_mipk;

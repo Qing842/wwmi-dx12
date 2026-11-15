@@ -25,6 +25,9 @@ public:
     WWMI_DEBUG_FN void NoteRefTextures(const DrawArgs& da) WWMI_DEBUG_BODY();
     // The draw's textures published for the section; the registers pushed, as a mask.
     uint16_t Publish(reshade::api::command_list* cmd_list, int dm, int comp, uint32_t rtv_count);
+    // Unclaimed draws while a mod with non-component-hash triggers is on screen: inspect bound ps-tN
+    // textures (including LOD/look-alike links) and dispatch matching [TextureOverride] sections.
+    void DispatchAuxTextures(const DrawArgs& da);
 
 private:
     struct CarryKey {

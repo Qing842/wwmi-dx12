@@ -260,32 +260,50 @@ uint32_t LookupSmall(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes,
     const uint64_t vb_va = vb_res->GetGPUVirtualAddress() + vb_off;
     LookupMemo& m = t_memo[((vb_va >> 8) ^ (vb_va >> 20)) & 1023];
     const uint32_t gen = g_cache_gen.load(std::memory_order_acquire);
-    if (m.vb_va == vb_va && m.gen == gen) return m.hash;
+    if (m.vb_va == vb_va && m.gen == gen && !(ib_off == 0 && m.hash && ib_bytes > m.ib_bytes)) return m.hash;
+    uint32_t meanwhile = 0;
     {
         std::shared_lock l(g_mtx);
         auto it = g_cache.find(vb_va);
-        if (it != g_cache.end()) {
+        const bool further = ib_off == 0 && it != g_cache.end() && it->second.hash && ib_bytes > it->second.ib_bytes;
+        if (it != g_cache.end() && !further) {
             m = LookupMemo{ vb_va, it->second.hash, it->second.ib_bytes, gen };
             return it->second.hash;
         }
-        if ((g_inflight && g_inflight_job.vb_va == vb_va) || g_small_queued.count(vb_va)) return 0;
+        meanwhile = further ? it->second.hash : 0;
+        if ((g_inflight && g_inflight_job.vb_va == vb_va) || g_small_queued.count(vb_va)) return meanwhile;
     }
     D3D12_HEAP_PROPERTIES hp = {};
     D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
     const bool cpu_written = SUCCEEDED(vb_res->GetHeapProperties(&hp, &hf)) && hp.Type != D3D12_HEAP_TYPE_DEFAULT;
     std::unique_lock l(g_mtx);
-    if (g_cache.count(vb_va) || (g_inflight && g_inflight_job.vb_va == vb_va) || g_small_queued.count(vb_va)) return 0;
+    auto it = g_cache.find(vb_va);
+    const bool further = ib_off == 0 && it != g_cache.end() && it->second.hash && ib_bytes > it->second.ib_bytes;
+    if (it != g_cache.end() && !further) return it->second.hash;
+    meanwhile = further ? it->second.hash : 0;
+    if (g_inflight && g_inflight_job.vb_va == vb_va) return meanwhile;
+    if (g_small_queued.count(vb_va)) {
+        if (further) {
+            for (Job& j : g_small_pending)
+                if (j.vb_va == vb_va && j.ib_off == 0 && ib_bytes > j.ib_bytes) {
+                    j.ib_bytes = ib_bytes;
+                    break;
+                }
+        }
+        return meanwhile;
+    }
     if (cpu_written) {
         StoreLocked(vb_va, Cached{ 0, ib_bytes });
         return 0;
     }
     for (const Job& j : g_pending)
-        if (j.vb_va == vb_va) return 0;
+        if (j.vb_va == vb_va) return meanwhile;
+    if (g_small_pending.size() >= 128) return meanwhile;
     ib_res->AddRef();
     vb_res->AddRef();
     g_small_pending.push_back({ ib_res, vb_res, ib_off, ib_bytes, idx_size, vb_off, vb_stride, vb_va });
     g_small_queued.insert(vb_va);
-    return 0;
+    return meanwhile;
 }
 
 void ForgetRange(uint64_t va, uint64_t bytes)

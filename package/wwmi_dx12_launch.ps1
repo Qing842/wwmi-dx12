@@ -267,20 +267,23 @@ $engineIni = [IO.Path]::Combine($root, "Client\Saved\Config\WindowsNoEditor\Engi
 $engineCvars = [ordered]@{
     "r.TextureStreaming"                = "1"
     "r.Streaming.FullyLoadUsedTextures" = "0"
-    "r.Streaming.PoolSize"              = "4096"
+    "r.Streaming.UseAllMips"            = "0"
+    "r.Streaming.PoolSize"              = "3072"
     "r.Streaming.MaxTempMemoryAllowed"  = "256"
     "r.Streaming.FramesForFullUpdate"   = "2"
-    "r.Streaming.Boost"                 = "4"
+    "r.Streaming.Boost"                 = "1"
     "r.Streaming.MinBoost"              = "1"
     "r.Streaming.HLODStrategy"          = "0"
-    "r.MipMapLODBias"                   = "-1"
+    "r.MipMapLODBias"                   = "0"
     "r.D3D12.GPUTimeout"                = "0"
 }
 # As XXMI Launcher writes it for WWMI: characters keep the model mods replace out to the farthest camera.
+# Also mirror the streaming pool CVars into UserEngine.ini because UE reads ConsoleVariables there over Engine.ini.
 $userEngineIni = [IO.Path]::Combine($root, "Client\Config\UserEngine.ini")
 $userEngineCvars = [ordered]@{
     "r.Kuro.SkeletalMesh.DistanceLODBaseFOV" = "165"
 }
+foreach ($k in $engineCvars.Keys) { $userEngineCvars[$k] = $engineCvars[$k] }
 function Set-IniValues([string]$path, [string]$section, $values) {
     $lines = New-Object Collections.Generic.List[string]
     if ([IO.File]::Exists($path)) {

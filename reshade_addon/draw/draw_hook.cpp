@@ -107,6 +107,8 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
     DrawProbeVb6Reader(ctx);
     DrawProbeOffLeak(ctx);
 
+    if (!mc && g_recognition.AuxTriggerArmed()) g_section_textures.DispatchAuxTextures(args);
+
     if (g_draw_toggles.hide_unclaimed_char && !mc && index_count >= 2000) {
         uint64_t vb0 = 0;
         {

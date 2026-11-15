@@ -221,10 +221,10 @@ std::string SmallMeshReport(uint32_t count)
 }
 #endif
 
-bool RunSmallMeshOverrides(const DrawArgs& da)
+namespace {
+
+uint32_t LookupSmallFromDraw(const DrawArgs& da, uint32_t* out_vstride = nullptr)
 {
-    const bool menu_shape = g_settings.decensor && da.index_count == kMenuBackdropIndices;
-    if (da.index_count >= 256 || (!menu_shape && !g_recognition.SmallMeshAny())) return false;
     ID3D12Resource* ibr = nullptr;
     ID3D12Resource* vbr = nullptr;
     uint64_t ibva = 0;
@@ -247,21 +247,26 @@ bool RunSmallMeshOverrides(const DrawArgs& da)
     const char* const refused = !ibr || !vbr || !vstride ? "no buffers"
         : vb_off < 0                                     ? "base vertex before the buffer"
                                                          : nullptr;
+    if (out_vstride) *out_vstride = vstride;
+    if (refused) {
 #ifdef WWMI_DEBUG
-    if (refused) SmallMeshSeen(da, vbr, vbva, vstride, vsize, refused, 0);
+        SmallMeshSeen(da, vbr, vbva, vstride, vsize, refused, 0);
 #endif
-    if (refused) return false;
+        return 0;
+    }
     const uint32_t ib_off = (uint32_t)(ibva - ibr->GetGPUVirtualAddress()) + da.first_index * idxb;
     const uint32_t got = IbHash::LookupSmall(ibr, ib_off, da.index_count * idxb, idxb, vbr, (uint32_t)vb_off, vstride);
 #ifdef WWMI_DEBUG
     SmallMeshSeen(da, vbr, vbva, vstride, vsize, got ? "hash" : "pending or not hashed", got);
+#else
+    (void)vsize;
 #endif
-    if (!got) return false;
-    if (got == kMenuBackdropMesh) {
-        g_decensor_rest.MenuDrawn();
-        if (g_debug && DiagOnce("DECENSOR-REST", 0))
-            logger::write("DECENSOR rests while the game draws its character menu (backdrop mesh %08x)", got);
-    }
+    return got;
+}
+
+bool DispatchSmallMeshOverride(uint32_t got, const DrawArgs& da, uint32_t vstride)
+{
+    if (!got || !g_recognition.SmallMeshAny()) return false;
     thread_local uint32_t t_gen = 0;
     thread_local std::shared_ptr<const std::unordered_set<uint32_t>> t_hashes;
     if (g_recognition.SmallMeshGen() != t_gen) t_hashes = g_recognition.SmallMeshHashes(&t_gen);
@@ -276,6 +281,49 @@ bool RunSmallMeshOverrides(const DrawArgs& da)
             got, (unsigned long long)da.vs_hash, da.first_index, da.index_count, da.instance_count, vstride, ran,
             di.skip ? ", the draw dropped" : "");
     return di.skip;
+}
+
+bool DispatchDrawnMeshOverrides(
+    uint32_t got, const DrawArgs& da, uint32_t vstride, bool skip_any, bool log_drop, uint64_t vs_hash)
+{
+    std::shared_ptr<const std::unordered_set<uint32_t>> skip_vbhash;
+    if (got && skip_any) skip_vbhash = g_recognition.SkipVbHashes();
+    bool dispatched = false;
+    if (skip_vbhash && skip_vbhash->count(got)) {
+        PortApi::DrawInfo di;
+        di.first_index = da.first_index;
+        di.index_count = da.index_count;
+        di.instance_count = da.instance_count;
+        PortApi::DispatchTextureOverride(got, &di);
+        dispatched = true;
+        if (di.skip) {
+            g_recognition.NoteSkipVbHashDrop();
+            if (log_drop && g_debug && DiagOnce("SKIPONLY-DROP", (int)((vs_hash ^ got) ^ ((vs_hash ^ got) >> 32))))
+                logger::write("SKIPONLY-DROP vs=%016llx first=%u count=%u hash=%08x -- the game's draw is cancelled",
+                    (unsigned long long)vs_hash, da.first_index, da.index_count, got);
+            return true;
+        }
+    }
+    return !dispatched && DispatchSmallMeshOverride(got, da, vstride);
+}
+
+} // namespace
+
+bool RunSmallMeshOverrides(const DrawArgs& da)
+{
+    const bool menu_shape = g_settings.decensor && da.index_count == kMenuBackdropIndices;
+    if (da.index_count >= 256 || (!menu_shape && !g_recognition.SmallMeshAny() && !g_recognition.ModelHashAny()))
+        return false;
+    uint32_t vstride = 0;
+    const uint32_t got = LookupSmallFromDraw(da, &vstride);
+    if (!got) return false;
+    if (g_recognition.ModelHashAny()) g_recognition.NoteModelDrawn(got);
+    if (got == kMenuBackdropMesh) {
+        g_decensor_rest.MenuDrawn();
+        if (g_debug && DiagOnce("DECENSOR-REST", 0))
+            logger::write("DECENSOR rests while the game draws its character menu (backdrop mesh %08x)", got);
+    }
+    return DispatchSmallMeshOverride(got, da, vstride);
 }
 
 std::optional<bool> ClaimDraw(DrawContext& ctx)
@@ -293,7 +341,8 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
         if (mc_slot >= 0) mc_slot = PickSharedRangeSlot(cmd_list, first_index, index_count, mc_slot);
         const bool skip_any = g_recognition.SkipVbHashAny();
         const bool model_any = g_recognition.ModelHashAny();
-        const bool hash_it = g_debug || g_draw_toggles.ibhash_suppress || skip_any || model_any;
+        const bool small_any = g_recognition.SmallMeshAny();
+        const bool hash_it = g_debug || g_draw_toggles.ibhash_suppress || skip_any || model_any || small_any;
         if ((hash_it || g_settings.decensor) && mc_slot < 0 && index_count >= 256) {
             uint64_t bvb0 = 0;
             bool vb6 = false;
@@ -353,20 +402,7 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                             (unsigned long long)vs_hash, first_index, index_count, (unsigned long long)bvb0, ib_bytes,
                             vstride, got,
                             !got ? " (pending)" : (skip_vbhash && skip_vbhash->count(got) ? " IN the skip set" : ""));
-                    if (skip_vbhash && skip_vbhash->count(got)) {
-                        PortApi::DrawInfo di;
-                        di.first_index = first_index;
-                        di.index_count = index_count;
-                        PortApi::DispatchTextureOverride(got, &di);
-                        if (di.skip) {
-                            g_recognition.NoteSkipVbHashDrop();
-                            if (g_debug && DiagOnce("SKIPONLY-DROP", (int)((vs_hash ^ got) ^ ((vs_hash ^ got) >> 32))))
-                                logger::write(
-                                    "SKIPONLY-DROP vs=%016llx first=%u count=%u hash=%08x -- the game's draw is cancelled",
-                                    (unsigned long long)vs_hash, first_index, index_count, got);
-                            return true;
-                        }
-                    }
+                    if (DispatchDrawnMeshOverrides(got, da, vstride, skip_any, /*log_drop*/ true, vs_hash)) return true;
                     int match_mod = -1;
                     int match_comp = -1;
                     uint32_t match_hash = 0;
@@ -412,6 +448,14 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                                     match_comp, match_hash);
                         }
                     }
+                }
+            } else if (!skinned && (skip_any || model_any || small_any)) {
+                uint32_t vstride = 0;
+                const uint32_t got = LookupSmallFromDraw(da, &vstride);
+                if (got) {
+                    if (model_any) g_recognition.NoteModelDrawn(got);
+                    if (DispatchDrawnMeshOverrides(got, da, vstride, skip_any, /*log_drop*/ false, vs_hash))
+                        return true;
                 }
             }
         }

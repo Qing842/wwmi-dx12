@@ -14,6 +14,16 @@ using namespace reshade::api;
 
 PresenceTriggers g_presence;
 
+namespace {
+bool OwnsCompHash(const GeoMod& gm, uint32_t hash)
+{
+    if (!hash) return false;
+    for (const WwmiMod::Component& c : gm.mod.comps)
+        if (c.ib_hash == hash) return true;
+    return false;
+}
+} // namespace
+
 struct PresenceTriggers::PerSet : SetState {
     std::vector<std::pair<std::wstring, std::wstring>> trigs; // (ns, section)
     bool cleared = false;
@@ -24,7 +34,8 @@ struct PresenceTriggers::PerSet : SetState {
         std::wstring fq;
         std::vector<int> mods; // units whose components carry the hash: their claim is a draw of the model
     };
-    std::vector<ModelFlag> model_flags; // other mods' variable-only sections keyed to a model's hash
+    std::vector<ModelFlag> model_flags; // variable-only sections keyed to a non-component mesh/tex hash
+    std::vector<int> aux_mods; // GeoMod units owning at least one non-component-hash auxiliary section
 };
 
 void PresenceTriggers::Tick()
@@ -32,6 +43,8 @@ void PresenceTriggers::Tick()
     PerSet& ps = CurrentSet().State<PerSet>();
     if (!ps.cleared) {
         ps.cleared = true;
+        ps.aux_mods.clear();
+        g_recognition.SetAuxTriggerArmed(false);
         g_recognition.SetSkipVbHashes(nullptr); // rebuilt below
         g_recognition.SetSmallMeshHashes(nullptr);
         g_recognition.SetModelHashes(nullptr);
@@ -51,12 +64,18 @@ void PresenceTriggers::Tick()
                 if (hash && g_tex_rules.Now().hash_to_rule.count(hash)) return;
                 const wchar_t* ns_beg = wcschr(fq, L'\\'); // skip the type prefix
                 if (!ns_beg || ns_beg >= leaf) return;
+                const std::wstring ns(ns_beg + 1, leaf);
                 if (SectionReadsPipelineState(fq)) {
                     std::lock_guard<std::mutex> l(g_cs_trigs_mtx);
-                    g_cs_trigs.push_back({ std::wstring(ns_beg + 1, leaf), std::wstring(fq), hash });
+                    g_cs_trigs.push_back({ ns, std::wstring(fq), hash });
                     return;
                 }
-                out->emplace_back(std::wstring(ns_beg + 1, leaf), std::wstring(fq));
+                // Only fire unconditionally on mod presence when the section is keyed to one of this unit's own
+                // Component ib_hash values; other hashes (secondary forms, weapons, VFX textures) belong in
+                // model_flags and fire only when that secondary hash is actually drawn.
+                const int md = Mods().IdOfNs(ns);
+                if (md < 0 || !OwnsCompHash(Mods().At((size_t)md), hash)) return;
+                out->emplace_back(ns, std::wstring(fq));
             },
             &ps.trigs);
         ps.built = true;
@@ -90,15 +109,25 @@ void PresenceTriggers::Tick()
             PortApi::ForEachVarTextureOverride(
                 [](uint32_t hash, const wchar_t* fq, void* user) {
                     if (!hash || !fq || g_tex_rules.Now().hash_to_rule.count(hash)) return;
+                    if (SectionReadsPipelineState(fq)) return;
                     const wchar_t* a = wcschr(fq, L'\\');
                     const wchar_t* z = wcsrchr(fq, L'\\');
                     if (!a || z <= a) return;
                     const size_t n = (size_t)(z - a - 1);
-                    for (const GeoMod& gm : Mods().Units())
-                        if (gm.wcl_ns.size() == n && _wcsnicmp(gm.wcl_ns.c_str(), a + 1, n) == 0) return;
-                    ((std::vector<PerSet::ModelFlag>*)user)->push_back(PerSet::ModelFlag{ hash, fq, {} });
+                    auto* p = (PerSet*)user;
+                    const auto& units = Mods().Units();
+                    for (size_t mi = 0; mi < units.size(); ++mi) {
+                        const GeoMod& gm = units[mi];
+                        if (gm.wcl_ns.size() == n && _wcsnicmp(gm.wcl_ns.c_str(), a + 1, n) == 0) {
+                            if (OwnsCompHash(gm, hash)) return; // stays in ps.trigs
+                            if (std::find(p->aux_mods.begin(), p->aux_mods.end(), (int)mi) == p->aux_mods.end())
+                                p->aux_mods.push_back((int)mi);
+                            break;
+                        }
+                    }
+                    p->model_flags.push_back(PerSet::ModelFlag{ hash, fq, {} });
                 },
-                &ps.model_flags);
+                &ps);
             auto hashes = std::make_shared<std::unordered_set<uint32_t>>();
             size_t on_mods = 0;
             for (PerSet::ModelFlag& mf : ps.model_flags) {
@@ -146,7 +175,15 @@ void PresenceTriggers::Tick()
             for (auto& [tns, tfq] : ps.trigs)
                 if (_wcsicmp(tns.c_str(), uns.c_str()) == 0) PortApi::RunSectionByName(tfq.c_str(), nullptr);
         }
-    if (!ps.built || ps.model_flags.empty()) return;
+    if (!ps.built) return;
+    bool aux_on = false;
+    for (const int md : ps.aux_mods)
+        if (Mods().OnScreen(md)) {
+            aux_on = true;
+            break;
+        }
+    g_recognition.SetAuxTriggerArmed(aux_on);
+    if (ps.model_flags.empty()) return;
     constexpr uint32_t kModelFrames = 2;
     std::unordered_set<uint32_t> drawn;
     g_recognition.ModelsDrawnWithin(kModelFrames, drawn);
