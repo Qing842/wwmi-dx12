@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (Get-Process -Name "Client-Win64-Shipping" -ErrorAction SilentlyContinue) {
+if (-not $LauncherOnly -and (Get-Process -Name "Client-Win64-Shipping" -ErrorAction SilentlyContinue)) {
     Write-Error "Wuthering Waves (Client-Win64-Shipping) is running. Close the game before deploying."
     exit 1
 }
@@ -50,7 +50,7 @@ Backup-Once $launchDst
 Write-Host "Deployed: $launchDst"
 
 $csoSrcDir = [IO.Path]::Combine($PSScriptRoot, "shaders_cso")
-if ([IO.Directory]::Exists($csoSrcDir)) {
+if (-not $LauncherOnly -and [IO.Directory]::Exists($csoSrcDir)) {
     $csoDstDir = [IO.Path]::Combine($GameWin64, "wwmi_dx12")
     [void][IO.Directory]::CreateDirectory($csoDstDir)
     foreach ($cso in [IO.Directory]::GetFiles($csoSrcDir, "*.cso")) {

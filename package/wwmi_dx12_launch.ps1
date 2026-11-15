@@ -1,6 +1,7 @@
 # Run through wwmi_dx12_launch.bat, from the game's Client\Binaries\Win64 folder.
 # Paths go through .NET: the PowerShell provider reads [ ] in a folder name as a wildcard.
 $ErrorActionPreference = "Stop"
+$scriptArgs = @($args)
 $dir    = $PSScriptRoot
 $proc   = "Client-Win64-Shipping"
 $proxy  = [IO.Path]::Combine($dir, "dxgi.dll")
@@ -41,6 +42,19 @@ function Save-WwmiSetting([string]$value) {
     if (-not $wwmiKey.IsMatch($text)) { $text = ([regex]'(?m)^\[wwmi-dx12\][^\r\n]*').Replace($text, "`$0`r`nwwmi_dir =", 1) }
     $text = $wwmiKey.Replace($text, "wwmi_dir = $value".Replace('$', '$$'), 1)
     [IO.File]::WriteAllText($ini, $text, [Text.Encoding]::Unicode)
+}
+$autoStartKey = [regex]'(?mi)^[ \t]*auto_start_sec[ \t]*=([^\r\n]*)'
+function Get-AutoStartSec {
+    foreach ($a in $scriptArgs) {
+        if ($a -ieq "-nowait") { return 0 }
+        if ($a -ieq "-wait" -or $a -ieq "-menu") { return -1 }
+    }
+    if ([IO.File]::Exists($ini)) {
+        $m = $autoStartKey.Match([IO.File]::ReadAllText($ini))
+        $parsed = 0
+        if ($m.Success -and [int]::TryParse($m.Groups[1].Value.Trim(), [ref]$parsed)) { return $parsed }
+    }
+    return 2
 }
 
 function Get-ReShadeAddonPath([string]$file) {
@@ -326,8 +340,9 @@ function Write-Graphics {
     $note = if ($installed -contains $tier) { "(installed)" } else { "(not found in this game folder)" }
     Write-Host $note.PadRight(34)
 }
+$autoSec = Get-AutoStartSec
 $have = Get-AddonRelease
-$updateCheck = if ($have) { Start-UpdateCheck $have } else { $null }
+$updateCheck = if ($have -and $autoSec -lt 0) { Start-UpdateCheck $have } else { $null }
 $update = @()
 $updateRow = -1
 $updateBright = $true
@@ -401,51 +416,95 @@ $graphicsRow = -1
 try { $graphicsRow = [Console]::CursorTop } catch {}
 Write-Graphics
 Write-Host ""
-Write-Host "  Left / Right   choose the graphics files"
-Write-Host "  Esc            quit"
-Write-Host "  any other key  start the game"
-if ($updateCheck) {
-    Write-Host ""
-    try { $updateRow = [Console]::CursorTop } catch {}
-    Write-UpdateLine
-    Write-Host ""
-}
-while ($true) {
-    try { $ready = [Console]::KeyAvailable } catch { break }
-    if (-not $ready) {
-        if ($updateCheck -and $updateCheck.Run.IsCompleted) {
-            $update = @(Receive-UpdateCheck $updateCheck)
-            $updateCheck = $null
-            if ($updateRow -ge 0) { Write-UpdateLineInPlace }
-            if (-not $update.Count) { $updateRow = -1 }
-            elseif ($updateRow -ge 0) { Show-Update }
+if ($autoSec -eq 0) {
+    Write-Host "  Auto-start     starting [$($tier.ToUpper())]..."
+} else {
+    Write-Host "  Left / Right   choose the graphics files"
+    Write-Host "  Esc            quit"
+    $startRow = -1
+    try { $startRow = [Console]::CursorTop } catch {}
+    function Write-StartLine([int]$secLeft) {
+        $text = if ($secLeft -gt 0) {
+            "  Auto-start     in ${secLeft}s (or press any other key now)"
+        } else {
+            "  any other key  start the game"
         }
-        if ($updateRow -ge 0 -and (Get-Date) -ge $updateFlashAt) {
-            if ($update.Count) {
-                $updateBright = -not $updateBright
-                $updateFlashAt = (Get-Date).AddMilliseconds(1500)
-            } else {
-                $updateDots = ($updateDots + 1) % 4
-                $updateFlashAt = (Get-Date).AddMilliseconds(400)
-            }
-            Write-UpdateLineInPlace
-        }
-        Start-Sleep -Milliseconds 50
-        continue
+        Write-Host $text.PadRight(58)
     }
-    try { $key = [Console]::ReadKey($true) } catch { break }
-    if ($key.Key -eq [ConsoleKey]::Escape) { exit 0 }
-    $step = 0
-    if (@([ConsoleKey]::LeftArrow, [ConsoleKey]::UpArrow) -contains $key.Key) { $step = -1 }
-    elseif (@([ConsoleKey]::RightArrow, [ConsoleKey]::DownArrow, [ConsoleKey]::Tab) -contains $key.Key) { $step = 1 }
-    if ($step -eq 0) { break }
-    $tier = $tiers[([array]::IndexOf($tiers, $tier) + $step + $tiers.Count) % $tiers.Count]
-    try {
-        $back = [Console]::CursorTop
-        [Console]::SetCursorPosition(0, $graphicsRow)
-        Write-Graphics
-        [Console]::SetCursorPosition(0, $back)
-    } catch { Write-Graphics }
+    Write-StartLine $autoSec
+    if ($updateCheck) {
+        Write-Host ""
+        try { $updateRow = [Console]::CursorTop } catch {}
+        Write-UpdateLine
+        Write-Host ""
+    }
+    $autoDeadline = if ($autoSec -gt 0) { (Get-Date).AddSeconds($autoSec) } else { $null }
+    $lastShownSec = $autoSec
+    while ($true) {
+        try { $ready = [Console]::KeyAvailable } catch { break }
+        if (-not $ready) {
+            if ($autoDeadline -ne $null) {
+                $remMs = ($autoDeadline - (Get-Date)).TotalMilliseconds
+                if ($remMs -le 0) { break }
+                $secLeft = [int][Math]::Ceiling($remMs / 1000.0)
+                if ($secLeft -ne $lastShownSec) {
+                    $lastShownSec = $secLeft
+                    if ($startRow -ge 0) {
+                        try {
+                            $back = [Console]::CursorTop
+                            [Console]::SetCursorPosition(0, $startRow)
+                            Write-StartLine $secLeft
+                            [Console]::SetCursorPosition(0, $back)
+                        } catch {}
+                    }
+                }
+            }
+            if ($updateCheck -and $updateCheck.Run.IsCompleted) {
+                $update = @(Receive-UpdateCheck $updateCheck)
+                $updateCheck = $null
+                if ($updateRow -ge 0) { Write-UpdateLineInPlace }
+                if (-not $update.Count) { $updateRow = -1 }
+                elseif ($updateRow -ge 0) { Show-Update }
+            }
+            if ($updateRow -ge 0 -and (Get-Date) -ge $updateFlashAt) {
+                if ($update.Count) {
+                    $updateBright = -not $updateBright
+                    $updateFlashAt = (Get-Date).AddMilliseconds(1500)
+                } else {
+                    $updateDots = ($updateDots + 1) % 4
+                    $updateFlashAt = (Get-Date).AddMilliseconds(400)
+                }
+                Write-UpdateLineInPlace
+            }
+            Start-Sleep -Milliseconds 50
+            continue
+        }
+        try { $key = [Console]::ReadKey($true) } catch { break }
+        if ($key.Key -eq [ConsoleKey]::Escape) { exit 0 }
+        $step = 0
+        if (@([ConsoleKey]::LeftArrow, [ConsoleKey]::UpArrow) -contains $key.Key) { $step = -1 }
+        elseif (@([ConsoleKey]::RightArrow, [ConsoleKey]::DownArrow, [ConsoleKey]::Tab) -contains $key.Key) { $step = 1 }
+        if ($step -eq 0) { break }
+        $tier = $tiers[([array]::IndexOf($tiers, $tier) + $step + $tiers.Count) % $tiers.Count]
+        if ($autoDeadline -ne $null) {
+            $autoDeadline = $null
+            $lastShownSec = -1
+            if ($startRow -ge 0) {
+                try {
+                    $back = [Console]::CursorTop
+                    [Console]::SetCursorPosition(0, $startRow)
+                    Write-StartLine -1
+                    [Console]::SetCursorPosition(0, $back)
+                } catch {}
+            }
+        }
+        try {
+            $back = [Console]::CursorTop
+            [Console]::SetCursorPosition(0, $graphicsRow)
+            Write-Graphics
+            [Console]::SetCursorPosition(0, $back)
+        } catch { Write-Graphics }
+    }
 }
 if ($updateCheck) { try { [void]$updateCheck.Shell.BeginStop($null, $null) } catch {} }
 Write-Host ""
