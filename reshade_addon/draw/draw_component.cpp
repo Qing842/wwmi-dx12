@@ -70,6 +70,8 @@ static void PublishDrawShaders(reshade::api::command_list* cmd_list, uint64_t vs
 // The section's RabbitFX hooks: the `ref` lines that name its maps, and the `run` that binds them.
 static void InstallRfxHooks(ComponentRun& run)
 {
+    s_rfx_glowmap_fq.clear();
+    s_rfx_fxmap_fq.clear();
     run.hk.resource_ref = [&run](const std::wstring& lhs_fq, const std::wstring& rhs_fq) {
         if (lhs_fq.find(L"rabbitfx") == std::wstring::npos) return;
         RfxDrawState& rfx = run.rfx;
@@ -152,6 +154,12 @@ static void InstallRfxHooks(ComponentRun& run)
                 s_rfx_fxmap_fq.c_str(), (unsigned long long)fxm.ptr,
                 rfx_glow.active ? "ARMED" : "inactive(no glow map)", fxm.ptr ? "; FX map present" : "");
         }
+        s_rfx_glowmap_fq.clear();
+        s_rfx_fxmap_fq.clear();
+        PortApi::SetVar(L"rabbitfx\\h", 0.f);
+        PortApi::SetVar(L"rabbitfx\\s", 0.f);
+        PortApi::SetVar(L"rabbitfx\\v", 0.f);
+        PortApi::SetVar(L"rabbitfx\\brightness", 0.f);
     };
 }
 

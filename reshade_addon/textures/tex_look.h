@@ -66,6 +66,7 @@ private:
     bool loaded_ = false;
     bool dirty_ = false;
     uint64_t dirty_at_ = 0;
+    uint64_t first_dirty_at_ = 0;
     std::wstring dir_;
     std::vector<std::pair<std::wstring, std::wstring>>
         imported_; // seed taken -> its DISABLED_ name, after the next write

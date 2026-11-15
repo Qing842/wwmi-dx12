@@ -36,8 +36,10 @@ template <typename T> bool get(FILE* f, T& v)
 
 void TexLook::MarkDirty()
 { // caller holds mtx_
+    const uint64_t now = GetTickCount64();
+    if (!dirty_) first_dirty_at_ = now;
     dirty_ = true;
-    dirty_at_ = GetTickCount64();
+    dirty_at_ = now;
 }
 
 bool TexLook::KeepPlace(PlaceMap& m, uint64_t place, uint32_t target)
@@ -361,6 +363,7 @@ void TexLook::Write()
         return;
     }
     dirty_ = false;
+    first_dirty_at_ = 0;
     logger::trace(
         "TexLook: saved %zu reference(s), %zu verdict(s), %zu place(s), %zu mesh place(s); this session %u "
         "decoded, %u skipped by their hash, %u matched, %u new reference(s), %u new place(s), %u look-alike(s) by "
@@ -417,7 +420,9 @@ void TexLook::Init(const std::wstring& cache_dir)
 void TexLook::FlushIfQuiet(unsigned quiet_ms)
 {
     std::unique_lock l(mtx_);
-    if (dirty_ && GetTickCount64() - dirty_at_ >= quiet_ms) Write();
+    if (!dirty_) return;
+    const uint64_t now = GetTickCount64();
+    if (now - dirty_at_ >= quiet_ms || (first_dirty_at_ && now - first_dirty_at_ >= 15000)) Write();
 }
 
 void TexLook::OnExit()

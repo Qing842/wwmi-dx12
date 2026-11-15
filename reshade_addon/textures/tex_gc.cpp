@@ -24,13 +24,13 @@ constexpr uint64_t kGameWindowMs = 10000;
 constexpr uint64_t kRunGapMs = 250; // on screen: drawn this recently; a run of draws survives a gap this long
 constexpr uint64_t kSettleMs = 1000;
 constexpr uint64_t kQuietMs = 5000; // after a collection that could not act on tight or a raise, before they ask again
-constexpr uint64_t kIdleMs[3] = { 5000, 10000, 60000 }; // unseen this long: 0 and 1 give way first, 2 goes down to 1
-constexpr uint64_t kOnScreenMs = 3000; // tight this long before what is on screen is lowered
+constexpr uint64_t kIdleMs[3] = { 2500, 5000, 20000 }; // unseen this long: 0 and 1 give way first, 2 goes down to 1
+constexpr uint64_t kOnScreenMs = 1500; // tight this long before what is on screen is lowered
 constexpr auto kAfterPass = std::chrono::seconds(1); // a pass's old copies die after it, still in the usage meanwhile
 constexpr uint64_t kFarMs = 5000; // A20: drawn smaller through this long before it goes down to match
 constexpr unsigned kMaxLower = 64;
-constexpr unsigned kMaxEvict = 32;
-constexpr uint64_t kMaxEvictBytes = 512 * kMb;
+constexpr unsigned kMaxEvict = 64;
+constexpr uint64_t kMaxEvictBytes = 1024 * kMb;
 constexpr unsigned kMaxLowerDrawn = 32;
 constexpr uint64_t kMaxRaiseBytes = 256 * kMb;
 
@@ -125,7 +125,7 @@ void TexGc::Sample(uint64_t now, bool loading)
         uint64_t game = 0;
         for (const GameSample& s : game_) game = (std::max)(game, s.game);
         reading_.game = game;
-        const uint64_t margin = budget / 20;
+        const uint64_t margin = (std::max)(budget / 8, 1536 * kMb);
         const uint64_t band = budget / 40;
         reading_.available = budget > reading_.game_now + margin ? budget - reading_.game_now - margin : 0;
         reading_.room = reading_.available > band ? reading_.available - band : 0;
@@ -344,7 +344,7 @@ void TexGc::Decide(std::vector<Item>& items)
             }
         }
         while (tight_ && through && now >= tight_ms_ + kOnScreenMs && projected > target &&
-            lowered_drawn < kMaxLowerDrawn && projected > (int64_t)(2048ull * kMb)) {
+            lowered_drawn < kMaxLowerDrawn && projected > (int64_t)(1280ull * kMb)) {
             Item* pick = nullptr;
             for (size_t i = 0; i < items.size(); ++i) {
                 Item& it = items[i];

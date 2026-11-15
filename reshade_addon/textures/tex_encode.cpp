@@ -343,7 +343,11 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
     std::vector<Band> take;
     {
         std::lock_guard l(ring_mtx_);
+        size_t live = 0;
         while (!read_.empty() && (read_.front().s->dst || read_.front().s->dropped.load(std::memory_order_acquire))) {
+            const bool is_live = !read_.front().s->dropped.load(std::memory_order_acquire);
+            if (is_live && live >= 2) break;
+            if (is_live) ++live;
             take.push_back(std::move(read_.front()));
             read_.pop_front();
         }
@@ -358,6 +362,7 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
     };
     std::vector<InList> in_list;
     std::vector<char> recorded(take.size());
+    bool any_dispatched = false;
     for (size_t i = 0; i < take.size(); ++i) {
         const Band& b = take[i];
         Stream& s = *b.s;
@@ -443,7 +448,14 @@ uint64_t TexEncoder::SubmitBands(ID3D12Device* dev, ID3D12CommandQueue* queue)
         f.cl->SetComputeRootDescriptorTable(1, at->srv);
         f.cl->SetComputeRootUnorderedAccessView(2, s.blocks->GetGPUVirtualAddress());
         f.cl->SetComputeRootUnorderedAccessView(3, err_->GetGPUVirtualAddress());
+        if (any_dispatched) {
+            D3D12_RESOURCE_BARRIER uav{};
+            uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav.UAV.pResource = err_.Get();
+            f.cl->ResourceBarrier(1, &uav);
+        }
         f.cl->Dispatch((bx + 7) / 8, (rows + 7) / 8, 1);
+        any_dispatched = true;
         const D3D12_RESOURCE_BARRIER post[2] = {
             Transition(s.blocks.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
             Transition(s.scratch.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)

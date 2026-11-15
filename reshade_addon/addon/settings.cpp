@@ -25,10 +25,8 @@ void AddonSettings::Load(const std::wstring& path)
     const int budget_step = Int(L"tex_mod_budget", 1);
     tex_mod_budget = budget_step >= 0 && budget_step < kTexBudgetSteps ? budget_step : 1;
     tex_distance = Int(L"tex_distance", 0) != 0;
-#ifdef WWMI_DEBUG
     tex_watch_ms = (unsigned)Int(L"tex_watch_ms", 2000);
     tex_vram_cap_mb = (unsigned)Int(L"tex_vram_cap_mb", 0);
-#endif
 }
 
 int AddonSettings::Int(const wchar_t* key, int fallback) const

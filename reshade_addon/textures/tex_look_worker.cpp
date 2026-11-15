@@ -20,7 +20,7 @@ void TexLookWorker::Run()
                 l.unlock();
                 g_tex_lod.FlushIfQuiet(2000);
                 g_tex_crawl.FlushIfQuiet(10000);
-                g_tex_look.FlushIfQuiet(10000);
+                g_tex_look.FlushIfQuiet(2500);
                 continue;
             }
             if (stop_) return;
