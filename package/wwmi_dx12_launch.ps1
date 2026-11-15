@@ -310,7 +310,7 @@ function Clear-EngineReadOnly {
     }
 }
 
-$tiers = @("hd", "uhd", "sd")
+$tiers = @("uhd", "hd", "sd")
 $installed = @($tiers | Where-Object { [IO.Directory]::Exists([IO.Path]::Combine($root, "Client", "Content", $_.ToUpper())) })
 $tier = if ($installed.Count) { $installed[0] } else { "hd" }
 

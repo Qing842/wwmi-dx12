@@ -93,7 +93,9 @@ void SectionPsStamper::PlanStamps(SectionPsStamps& out, device* dev, const RootP
             g_mod_textures.Touch(index);
             stored = index >= 0;
         } else {
-            if (!g_draw_toggles.ps_slot_stamp_nulls || g_tex_defer.Pending(dm) || PortApi::BoundLoading()) continue;
+            if (r >= kSectionTexRegs || !g_draw_toggles.ps_slot_stamp_nulls || g_tex_defer.Pending(dm) ||
+                PortApi::BoundLoading())
+                continue;
             src = g_stamps.NullSrv(g_addon.d3d12_device, ps_regs.parsed ? ps_regs.kind[r] : 0);
             if (!src.ptr) continue;
         }

@@ -118,6 +118,18 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
         s2 = first_index;
     } // drawindexed=auto
     if (mc && mc->hide) return;
+    {
+        const MigotoPort::PipeState& st = MigotoPort::State();
+        if (MigotoPort::AsShaderCode(st.shader[1]) || MigotoPort::AsShaderCode(st.shader[2]) ||
+            MigotoPort::AsShaderCode(st.shader[3]) || MigotoPort::AsShaderCode(st.shader[4])) {
+            if (g_debug && DiagOnce("SECTDRAW-CUSTOMPS", CompKey(dm, wc ? (int)wc->index : 0)))
+                logger::write(
+                    "SECTDRAW-CUSTOMPS mod=%d comp=%d: [CustomShader] binds a custom PS/GS/HS/DS without a custom VS "
+                    "(cannot mix SM5 DXBC with the game's DXIL VS) -- skipped",
+                    dm, wc ? (int)wc->index : -1);
+            return;
+        }
+    }
     if (g_settings.hide_outline) { // A8: the outline shell is the front-culling pass
         reshade::api::cull_mode cm = reshade::api::cull_mode::none;
         const uint64_t pso = g_command_lists.Gfx(cmd_list).gfx_pso;
