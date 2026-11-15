@@ -129,121 +129,78 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
     MigotoPort::FlushUavBarriers(d3d12_cl);
     const VfRestore vf_restore = g_rt_draw.SkinDraw(cmd_list, d3d12_cl, dm, wc, c, s2, first_index, index_count, vertex_offset,
         vs_hash, dc.b4_va, dc.b4_root, run.rtpal_no_merge);
+    const uint64_t base_pso = g_command_lists.Gfx(cmd_list).gfx_pso;
     const MigotoPort::LayoutOverride layout_ovr = MigotoPort::State().layout_override;
-    ID3D12PipelineState* blend_pso = nullptr;
-    uint64_t restore_pso = 0;
-    MigotoPort::StateDesc* cs_blend = MigotoPort::AsStateDesc(MigotoPort::State().blend);
+    MigotoPort::StateDesc* const cs_blend = MigotoPort::AsStateDesc(MigotoPort::State().blend);
     if (cs_blend) {
         if (!g_draw_toggles.custom_subdraw) return;
         ++g_draw_stats.custom_blend_count;
-        if (g_draw_toggles.custom_blend && !layout_ovr.count) {
-            {
-                restore_pso = g_command_lists.Gfx(cmd_list).gfx_pso;
-            }
-            blend_pso = g_pso_variants.BlendFromDesc(cmd_list->get_device(), restore_pso, &cs_blend->blend,
-                MigotoPort::State().blend_factor, DecensorOn());
-            if (blend_pso) {
-                d3d12_cl->SetPipelineState(blend_pso);
-                const FLOAT* bf = MigotoPort::State().blend_factor;
-                float fac[4];
-                for (int i2 = 0; i2 < 3; ++i2)
-                    fac[i2] = (g_draw_toggles.custom_blend_factor >= 0.f) ? g_draw_toggles.custom_blend_factor : bf[i2];
-                fac[3] = bf[3];
-                d3d12_cl->OMSetBlendFactor(fac);
-                ++g_draw_stats.custom_blend_bound_count;
-            }
-            if (g_debug) {
-                static std::atomic<bool> once{ false };
-                bool e = false;
-                const FLOAT* dbf = MigotoPort::State().blend_factor;
-                if (once.compare_exchange_strong(e, true))
-                    logger::write("CUSTOMBLEND from PipeState: enable=%d op=%d src=%d dst=%d "
-                                  "factor=%.3f,%.3f,%.3f,%.3f variant=%p",
-                        (int)cs_blend->blend.RenderTarget[0].BlendEnable, (int)cs_blend->blend.RenderTarget[0].BlendOp,
-                        (int)cs_blend->blend.RenderTarget[0].SrcBlend, (int)cs_blend->blend.RenderTarget[0].DestBlend,
-                        dbf[0], dbf[1], dbf[2], dbf[3], (void*)blend_pso);
-            }
-        }
     }
-    ID3D12PipelineState* layout_pso = nullptr;
+    const bool want_blend = cs_blend && g_draw_toggles.custom_blend;
+    bool want_layout = false;
     if (layout_ovr.count) {
-        const uint64_t src = g_command_lists.Gfx(cmd_list).gfx_pso;
-        if (layout_ovr.pso == src)
-            layout_pso = g_pso_variants.InputLayout(
-                cmd_list->get_device(), src, layout_ovr.elements, layout_ovr.count, DecensorOn(), false);
+        if (layout_ovr.pso == base_pso)
+            want_layout = true;
         else if (DiagOnce("ILAYOUT-PSO", CompKey(dm, wc ? (int)wc->index : 0)))
             logger::write(
                 "ILAYOUT mod=%d comp=%d: the layout override was made for pso=%llx, this draw has pso=%llx -- drawn with the game's layout",
-                dm, wc ? (int)wc->index : -1, layout_ovr.pso, (unsigned long long)src);
-        if (layout_pso) d3d12_cl->SetPipelineState(layout_pso);
-        if (cs_blend && g_draw_toggles.custom_blend && DiagOnce("ILAYOUT-BLEND", CompKey(dm, wc ? (int)wc->index : 0)))
-            logger::write(
-                "ILAYOUT mod=%d comp=%d: the section's blend is not applied -- the input-layout override takes the PSO",
-                dm, wc ? (int)wc->index : -1);
+                dm, wc ? (int)wc->index : -1, layout_ovr.pso, (unsigned long long)base_pso);
     }
     const SectionPsStamps sect_ps =
         g_ps_stamps.Plan(cmd_list, run.hk.srv_gen0, run.hk.this_gen, dm, wc ? (int)wc->index : -1);
     sect_ps.QueueForShadow();
     if (!sect_ps.shared) g_ps_stamps.StampInPlace(sect_ps);
     ID3D12PipelineState* rfxp_pso = nullptr;
-    uint64_t rfxp_restore = 0;
+    const uint64_t rfxp_restore = base_pso;
     bool rfxp_glow = false; // the variant carries the glow block AND this component armed it
     std::vector<WclSlotOvr> rfxp_binds;
     const bool rfx_censor = DecensorOn();
     if (g_rfx_toggles.patch && (rfx_glow.fxmap.ptr || rfx_glow.active) && !dc.full_shadow) {
-        if (blend_pso) {
-            if (DiagOnce("RFXPATCH-BLEND", CompKey(dm, wc ? (int)wc->index : 0)))
+        unsigned ps_max = 0;
+        unsigned win_base = 0;
+        unsigned win_count = 0;
+        bool has_glow = false;
+        rfxp_pso = g_rfx_patch.Variant(cmd_list->get_device(), rfxp_restore, &ps_max, &has_glow, rfx_censor);
+        if (rfxp_pso && !want_blend && want_layout) {
+            rfxp_pso = g_pso_variants.InputLayout(
+                cmd_list->get_device(), rfxp_restore, layout_ovr.elements, layout_ovr.count, rfx_censor, true);
+            if (!rfxp_pso && DiagOnce("RFXPATCH-LAYOUT", CompKey(dm, wc ? (int)wc->index : 0)))
                 logger::write(
-                    "RFXPATCH mod=%d comp=%d: a blend variant is active on this draw -- the patch is not applied to it",
+                    "RFXPATCH mod=%d comp=%d: no input-layout variant carrying the patched PS -- drawn unpatched",
                     dm, wc ? (int)wc->index : -1);
-        } else {
-            rfxp_restore = g_command_lists.Gfx(cmd_list).gfx_pso;
-            unsigned ps_max = 0;
-            unsigned win_base = 0;
-            unsigned win_count = 0;
-            bool has_glow = false;
-            rfxp_pso = g_rfx_patch.Variant(cmd_list->get_device(), rfxp_restore, &ps_max, &has_glow, rfx_censor);
-            if (rfxp_pso && layout_pso) {
-                rfxp_pso = g_pso_variants.InputLayout(
-                    cmd_list->get_device(), rfxp_restore, layout_ovr.elements, layout_ovr.count, rfx_censor, true);
-                if (!rfxp_pso && DiagOnce("RFXPATCH-LAYOUT", CompKey(dm, wc ? (int)wc->index : 0)))
-                    logger::write(
-                        "RFXPATCH mod=%d comp=%d: no input-layout variant carrying the patched PS -- drawn unpatched",
-                        dm, wc ? (int)wc->index : -1);
-            }
-            const unsigned top_reg = has_glow ? kRfxParamsReg : kRfxCutoutReg;
-            if (rfxp_pso && !g_rfx_bind.Param0Covers(cmd_list, ps_max > top_reg ? ps_max : top_reg, &win_base, &win_count)) {
-                if (DiagOnce("RFXPATCH-WINDOW", (int)(((rfxp_restore ^ (rfxp_restore >> 32)) * 31u) & 0x7fffffff)))
-                    logger::write(
-                        "RFXPATCH mod=%d comp=%d pso=%llx: the PS reads up to t%u and the patch needs t%u, the draw's first SRV table is t%u x%u -- drawn unpatched",
-                        dm, wc ? (int)wc->index : -1, (unsigned long long)rfxp_restore, ps_max, top_reg, win_base,
-                        win_count);
-                rfxp_pso = nullptr;
-                ++g_rfx_stats.patch_nobind;
-            }
-            D3D12_CPU_DESCRIPTOR_HANDLE null_tex{ 0 };
-            D3D12_CPU_DESCRIPTOR_HANDLE null_buf{ 0 };
-            if (rfxp_pso && !g_rfx_patch_srvs.NullSrvs(&null_tex, &null_buf)) {
-                rfxp_pso = nullptr;
-                ++g_rfx_stats.patch_nobind;
-            }
-            if (rfxp_pso) {
-                rfxp_binds.push_back({ (int)kRfxCutoutReg, rfx_glow.fxmap.ptr ? rfx_glow.fxmap : null_tex, false });
-                if (has_glow) {
-                    D3D12_CPU_DESCRIPTOR_HANDLE prm{ 0 };
-                    if (rfx_glow.active)
-                        prm = g_rfx_patch_srvs.ParamsSrv(rfx_glow.hue, rfx_glow.sat, rfx_glow.val, rfx_glow.brightness);
-                    rfxp_glow = (prm.ptr != 0);
-                    rfxp_binds.push_back({ (int)kRfxGlowReg, rfxp_glow ? rfx_glow.map : null_tex, false });
-                    rfxp_binds.push_back({ (int)kRfxParamsReg, rfxp_glow ? prm : null_buf, false });
-                }
+        }
+        const unsigned top_reg = has_glow ? kRfxParamsReg : kRfxCutoutReg;
+        if (rfxp_pso && !g_rfx_bind.Param0Covers(cmd_list, ps_max > top_reg ? ps_max : top_reg, &win_base, &win_count)) {
+            if (DiagOnce("RFXPATCH-WINDOW", (int)(((rfxp_restore ^ (rfxp_restore >> 32)) * 31u) & 0x7fffffff)))
+                logger::write(
+                    "RFXPATCH mod=%d comp=%d pso=%llx: the PS reads up to t%u and the patch needs t%u, the draw's first SRV table is t%u x%u -- drawn unpatched",
+                    dm, wc ? (int)wc->index : -1, (unsigned long long)rfxp_restore, ps_max, top_reg, win_base,
+                    win_count);
+            rfxp_pso = nullptr;
+            ++g_rfx_stats.patch_nobind;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE null_tex{ 0 };
+        D3D12_CPU_DESCRIPTOR_HANDLE null_buf{ 0 };
+        if (rfxp_pso && !g_rfx_patch_srvs.NullSrvs(&null_tex, &null_buf)) {
+            rfxp_pso = nullptr;
+            ++g_rfx_stats.patch_nobind;
+        }
+        if (rfxp_pso) {
+            rfxp_binds.push_back({ (int)kRfxCutoutReg, rfx_glow.fxmap.ptr ? rfx_glow.fxmap : null_tex, false });
+            if (has_glow) {
+                D3D12_CPU_DESCRIPTOR_HANDLE prm{ 0 };
+                if (rfx_glow.active)
+                    prm = g_rfx_patch_srvs.ParamsSrv(rfx_glow.hue, rfx_glow.sat, rfx_glow.val, rfx_glow.brightness);
+                rfxp_glow = (prm.ptr != 0);
+                rfxp_binds.push_back({ (int)kRfxGlowReg, rfxp_glow ? rfx_glow.map : null_tex, false });
+                rfxp_binds.push_back({ (int)kRfxParamsReg, rfxp_glow ? prm : null_buf, false });
             }
         }
     }
     RfxBindState tbind{};
     if (rfx_tex.d.ptr || rfx_tex.n.ptr || rfx_tex.l.ptr || rfx_tex.m.ptr) {
         PROF(PROF_DI_RfxDecide);
-        const DxilSrvRegs ps_regs = g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p');
+        const DxilSrvRegs ps_regs = g_pipelines.SrvRegs(base_pso, 'p');
         uint8_t ps_reads = 0;
         for (unsigned r = 0; r < 4; ++r)
             if (ps_regs.reads(r)) ps_reads |= (uint8_t)(1u << r);
@@ -260,14 +217,63 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
                 rfx_glow.fxmap.ptr ? "bound" : "null",
                 rfxp_glow ? "bound" : (rfx_glow.active ? "ARMED BUT NOT IN THIS VARIANT" : "null"),
                 bound ? "BOUND" : "NOT bindable (no param0 window: RABBITFX-BAIL above) -- drawn unpatched");
-        if (bound) {
-            d3d12_cl->SetPipelineState(rfxp_pso);
-            ++g_rfx_stats.patch_draws;
-            if (rfxp_glow) ++g_rfx_stats.glow_count;
-        } else {
+        if (!bound) {
             rfxp_pso = nullptr;
             rfxp_glow = false;
             ++g_rfx_stats.patch_nobind;
+        }
+    }
+    ID3D12PipelineState* blend_pso = nullptr;
+    ID3D12PipelineState* layout_pso = nullptr;
+    uint64_t restore_pso = 0;
+    if (want_blend) {
+        blend_pso = g_pso_variants.BlendFromDesc(cmd_list->get_device(), base_pso, &cs_blend->blend,
+            MigotoPort::State().blend_factor, rfx_censor, want_layout ? layout_ovr.elements : nullptr,
+            want_layout ? layout_ovr.count : 0, rfxp_pso != nullptr);
+        if (!blend_pso && rfxp_pso != nullptr) {
+            rfxp_pso = nullptr;
+            rfxp_glow = false;
+            blend_pso = g_pso_variants.BlendFromDesc(cmd_list->get_device(), base_pso, &cs_blend->blend,
+                MigotoPort::State().blend_factor, rfx_censor, want_layout ? layout_ovr.elements : nullptr,
+                want_layout ? layout_ovr.count : 0, false);
+        }
+        if (blend_pso) {
+            restore_pso = base_pso;
+            d3d12_cl->SetPipelineState(blend_pso);
+            const FLOAT* bf = MigotoPort::State().blend_factor;
+            float fac[4];
+            for (int i2 = 0; i2 < 3; ++i2)
+                fac[i2] = (g_draw_toggles.custom_blend_factor >= 0.f) ? g_draw_toggles.custom_blend_factor : bf[i2];
+            fac[3] = bf[3];
+            d3d12_cl->OMSetBlendFactor(fac);
+            ++g_draw_stats.custom_blend_bound_count;
+            if (rfxp_pso) {
+                ++g_rfx_stats.patch_draws;
+                if (rfxp_glow) ++g_rfx_stats.glow_count;
+            }
+        }
+        if (g_debug) {
+            static std::atomic<bool> once{ false };
+            bool e = false;
+            const FLOAT* dbf = MigotoPort::State().blend_factor;
+            if (once.compare_exchange_strong(e, true))
+                logger::write("CUSTOMBLEND from PipeState: enable=%d op=%d src=%d dst=%d "
+                              "factor=%.3f,%.3f,%.3f,%.3f variant=%p layout=%u rfx=%d",
+                    (int)cs_blend->blend.RenderTarget[0].BlendEnable, (int)cs_blend->blend.RenderTarget[0].BlendOp,
+                    (int)cs_blend->blend.RenderTarget[0].SrcBlend, (int)cs_blend->blend.RenderTarget[0].DestBlend,
+                    dbf[0], dbf[1], dbf[2], dbf[3], (void*)blend_pso, want_layout ? layout_ovr.count : 0u,
+                    (int)(rfxp_pso != nullptr));
+        }
+    }
+    if (!blend_pso) {
+        if (rfxp_pso) {
+            d3d12_cl->SetPipelineState(rfxp_pso);
+            ++g_rfx_stats.patch_draws;
+            if (rfxp_glow) ++g_rfx_stats.glow_count;
+        } else if (want_layout) {
+            layout_pso = g_pso_variants.InputLayout(
+                cmd_list->get_device(), base_pso, layout_ovr.elements, layout_ovr.count, rfx_censor, false);
+            if (layout_pso) d3d12_cl->SetPipelineState(layout_pso);
         }
     }
     if (sect_ps.shared && !tbind.applied) {
@@ -455,14 +461,12 @@ void SectionDrawIndexed(ComponentRun& run, uint32_t c, uint32_t s2, uint32_t b2)
         g_occl.End(d3d12_cl, oq);
     }
     if (tbind.bound) g_rfx_bind.Restore(d3d12_cl, tbind);
-    if (rfxp_pso && rfxp_restore) // the patched PS wrote the glow / cutout; back to the game's PSO
-        d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(g_command_lists.Gfx(cmd_list).gfx_restore()));
-    if (layout_pso)
-        d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(g_command_lists.Gfx(cmd_list).gfx_restore()));
-    if (blend_pso && restore_pso) {
+    if ((rfxp_pso && rfxp_restore) || layout_pso || (blend_pso && restore_pso)) {
         const CmdState& gs = g_command_lists.Gfx(cmd_list);
         d3d12_cl->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(gs.gfx_restore()));
-        const float def[4] = { 1.f, 1.f, 1.f, 1.f };
-        d3d12_cl->OMSetBlendFactor(gs.blend_factor_set ? gs.blend_factor : def);
+        if (blend_pso && restore_pso) {
+            const float def[4] = { 1.f, 1.f, 1.f, 1.f };
+            d3d12_cl->OMSetBlendFactor(gs.blend_factor_set ? gs.blend_factor : def);
+        }
     }
 }

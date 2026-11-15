@@ -1,0 +1,52 @@
+name: Build Custom Artifact
+
+on:
+  push:
+    branches: ['main']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out this commit and its two submodules
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          git init -q .
+          git remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+          git fetch -q --depth 1 origin $env:GITHUB_SHA
+          git checkout -q FETCH_HEAD
+          git submodule update --init --depth 1
+
+      - name: Fetch Dear ImGui, the one ReShade SDK dependency the build uses
+        run: git -C reshade_addon/sdk submodule update --init deps/imgui
+
+      - name: Fetch the XXMI tags the engine version is read from
+        shell: pwsh
+        run: |
+          if ((git -C third_party/3Dmigoto rev-parse --is-shallow-repository) -eq 'true') {
+            git -C third_party/3Dmigoto fetch --tags --unshallow
+          } else {
+            git -C third_party/3Dmigoto fetch --tags
+          }
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+          & $msbuild package.proj -m -nologo
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Upload built addon and release zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: wwmi-dx12-custom-build
+          path: |
+            build_addon/wwmi_dx12.addon64
+            build_addon/release/*.zip
+          retention-days: 14

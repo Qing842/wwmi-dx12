@@ -252,11 +252,15 @@ if ($reshadeVersion -lt $minReShade) {
 $engineIni = [IO.Path]::Combine($root, "Client\Saved\Config\WindowsNoEditor\Engine.ini")
 $engineCvars = [ordered]@{
     "r.TextureStreaming"                = "1"
-    "r.Streaming.FullyLoadUsedTextures" = "1"
-    "r.Streaming.Boost"                 = "30"
-    "r.Streaming.MinBoost"              = "30"
-    "r.Streaming.HLODStrategy"          = "2"
+    "r.Streaming.FullyLoadUsedTextures" = "0"
+    "r.Streaming.PoolSize"              = "4096"
+    "r.Streaming.MaxTempMemoryAllowed"  = "256"
+    "r.Streaming.FramesForFullUpdate"   = "2"
+    "r.Streaming.Boost"                 = "4"
+    "r.Streaming.MinBoost"              = "1"
+    "r.Streaming.HLODStrategy"          = "0"
     "r.MipMapLODBias"                   = "-1"
+    "r.D3D12.GPUTimeout"                = "0"
 }
 # As XXMI Launcher writes it for WWMI: characters keep the model mods replace out to the farthest camera.
 $userEngineIni = [IO.Path]::Combine($root, "Client\Config\UserEngine.ini")
@@ -306,7 +310,7 @@ function Clear-EngineReadOnly {
     }
 }
 
-$tiers = @("uhd", "hd", "sd")
+$tiers = @("hd", "uhd", "sd")
 $installed = @($tiers | Where-Object { [IO.Directory]::Exists([IO.Path]::Combine($root, "Client", "Content", $_.ToUpper())) })
 $tier = if ($installed.Count) { $installed[0] } else { "hd" }
 

@@ -108,9 +108,12 @@ void TexDefer::Run()
         unsigned made = 0;
         unsigned stale = 0;
         unsigned smaller = 0;
+        unsigned paced = 0;
         LONGLONG locked = 0;
         LONGLONG longest = 0;
-        for (const Job& job : batch) {
+        for (size_t idx = 0; idx < batch.size(); ++idx) {
+            const Job& job = batch[idx];
+            bool uploaded = false;
             {
                 std::lock_guard l(mtx_);
                 if (stop_) return;
@@ -125,6 +128,7 @@ void TexDefer::Run()
                 ID3D11Resource* res = PortApi::LoadDeferredTexture(job.tex);
                 QueryPerformanceCounter(&b);
                 if (res) {
+                    uploaded = true;
                     if (PortApi::PublishDeferredTexture(job.tex.fq_name.c_str(), res)) {
                         ++made;
                         if (job.tex.maxsize) ++smaller;
@@ -136,10 +140,14 @@ void TexDefer::Run()
                 locked += c.QuadPart - b.QuadPart;
                 if (b.QuadPart - a.QuadPart > longest) longest = b.QuadPart - a.QuadPart;
             }
-            std::lock_guard l(mtx_);
-            if (job.mod >= 0 && job.gen == gen_.load(std::memory_order_relaxed))
-                Slot(job.mod).fetch_sub(1, std::memory_order_acq_rel);
-            in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+            {
+                std::lock_guard l(mtx_);
+                if (job.mod >= 0 && job.gen == gen_.load(std::memory_order_relaxed))
+                    Slot(job.mod).fetch_sub(1, std::memory_order_acq_rel);
+                in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+            }
+            if (uploaded && batch.size() > 2 && idx + 1 < batch.size() && (++paced % 2) == 0)
+                Sleep(2);
         }
         loaded_.fetch_add(made, std::memory_order_acq_rel);
         QueryPerformanceCounter(&t1);

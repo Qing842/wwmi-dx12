@@ -23,9 +23,11 @@ struct PsoVariant {
 class PsoVariantCache {
 public:
     ID3D12PipelineState* Blend(reshade::api::device* dev, uint64_t src_pso, const std::string& blend_mode,
-        const std::string& alpha_mode, const float bf[4], bool decensor);
+        const std::string& alpha_mode, const float bf[4], bool decensor,
+        const struct D3D11_INPUT_ELEMENT_DESC* elements = nullptr, uint32_t elem_count = 0, bool rfx = false);
     ID3D12PipelineState* BlendFromDesc(reshade::api::device* dev, uint64_t src_pso,
-        const struct D3D11_BLEND_DESC* bdesc, const float bf[4], bool decensor);
+        const struct D3D11_BLEND_DESC* bdesc, const float bf[4], bool decensor,
+        const struct D3D11_INPUT_ELEMENT_DESC* elements = nullptr, uint32_t elem_count = 0, bool rfx = false);
     ID3D12PipelineState* InputLayout(reshade::api::device* dev, uint64_t src_pso,
         const struct D3D11_INPUT_ELEMENT_DESC* elements, uint32_t count, bool decensor, bool rfx);
     // The source with a list's own shaders and root signature in place of its own, and the blend, rasterizer, depth,

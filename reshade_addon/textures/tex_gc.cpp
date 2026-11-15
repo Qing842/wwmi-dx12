@@ -125,8 +125,8 @@ void TexGc::Sample(uint64_t now, bool loading)
         uint64_t game = 0;
         for (const GameSample& s : game_) game = (std::max)(game, s.game);
         reading_.game = game;
-        const uint64_t margin = budget / 20;
-        const uint64_t band = budget / 40;
+        const uint64_t margin = budget >= 8192 * kMb ? (std::max)(budget / 8, (uint64_t)1536 * kMb) : budget / 10;
+        const uint64_t band = budget >= 8192 * kMb ? (std::max)(budget / 20, (uint64_t)512 * kMb) : budget / 20;
         reading_.available = budget > reading_.game_now + margin ? budget - reading_.game_now - margin : 0;
         reading_.room = reading_.available > band ? reading_.available - band : 0;
         const uint64_t calm = budget > game + margin ? budget - game - margin : 0;

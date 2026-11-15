@@ -97,12 +97,100 @@ const char* TokFromD3D11Op(D3D11_BLEND_OP o)
     }
 }
 
+bool IsNonBlendableDxgiFormat(DXGI_FORMAT fmt)
+{
+    switch (fmt) {
+    case DXGI_FORMAT_UNKNOWN:
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT:
+    case DXGI_FORMAT_R32G32B32_UINT:
+    case DXGI_FORMAT_R32G32B32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_UINT:
+    case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8_SINT: return true;
+    default: return false;
+    }
+}
+
+bool RtBlendBlocked(int rt, const format* rtf, uint32_t rtf_count)
+{
+    return rt >= (int)rtf_count ||
+        (rtf && (IsNonBlendableDxgiFormat((DXGI_FORMAT)rtf[rt]) || (rtf_count >= 4 && rt >= 4)));
+}
+
+int FindSubobject(const std::vector<pipeline_subobject>& subs, pipeline_subobject_type t)
+{
+    for (size_t s = 0; s < subs.size(); ++s)
+        if (subs[s].type == t) return (int)s;
+    return -1;
+}
+
+uint64_t HashInputElements(const D3D11_INPUT_ELEMENT_DESC* elements, uint32_t count)
+{
+    uint64_t lkey = kFnv64Basis;
+    for (uint32_t i = 0; i < count; ++i) {
+        const D3D11_INPUT_ELEMENT_DESC& e = elements[i];
+        if (e.SemanticName) lkey = Fnv1a64(e.SemanticName, strlen(e.SemanticName), lkey);
+        const uint32_t v[3] = { e.SemanticIndex, (uint32_t)e.Format, e.AlignedByteOffset };
+        lkey = Fnv1a64(v, sizeof v, lkey);
+    }
+    return lkey;
+}
+
+CodeBlob ResolvePsVariant(uint64_t src_pso, bool decensor, bool rfx, uint64_t& salt)
+{
+    const CodeBlob dps = rfx ? g_patched_ps.Rfx(src_pso, decensor)
+        : decensor           ? g_patched_ps.Decensored(src_pso)
+                             : nullptr;
+    salt = !dps   ? 0ULL
+        : !rfx    ? 0x9E3779B97F4A7C15ULL
+        : decensor ? 0xD6E8FEB86659FD93ULL
+                   : 0xC2B2AE3D27D4EB4FULL;
+    return dps;
+}
+
+bool PatchInputLayout(std::vector<pipeline_subobject>& subs, const D3D11_INPUT_ELEMENT_DESC* elements, uint32_t count,
+    std::vector<input_element>& storage)
+{
+    const int il = FindSubobject(subs, pipeline_subobject_type::input_layout);
+    if (il < 0 || subs[il].count != count || !subs[il].data) return false;
+    const auto* src_elems = static_cast<const input_element*>(subs[il].data);
+    storage.assign(src_elems, src_elems + count);
+    for (uint32_t i = 0; i < count; ++i) {
+        storage[i].semantic = elements[i].SemanticName;
+        storage[i].semantic_index = elements[i].SemanticIndex;
+        storage[i].format = (format)elements[i].Format;
+        storage[i].offset = elements[i].AlignedByteOffset;
+    }
+    subs[il].data = storage.data();
+    return true;
+}
+
 // A [CustomShader]'s D3D11 blend over the source's: per target, or target 0's for all without independent blend.
-bool OverBlend(const D3D11_BLEND_DESC& d, blend_desc& out)
+bool OverBlend(const D3D11_BLEND_DESC& d, blend_desc& out, const format* rtf = nullptr, uint32_t rtf_count = 8)
 {
     out.alpha_to_coverage_enable = d.AlphaToCoverageEnable != FALSE;
     for (int rt = 0; rt < 8; ++rt) {
         const D3D11_RENDER_TARGET_BLEND_DESC& r = d.RenderTarget[d.IndependentBlendEnable ? rt : 0];
+        if (!d.IndependentBlendEnable && RtBlendBlocked(rt, rtf, rtf_count)) {
+            out.blend_enable[rt] = false;
+            out.render_target_write_mask[rt] = r.RenderTargetWriteMask;
+            continue;
+        }
         out.blend_enable[rt] = r.BlendEnable != FALSE;
         out.render_target_write_mask[rt] = r.RenderTargetWriteMask;
         if (!r.BlendEnable) continue;
@@ -123,17 +211,11 @@ bool OverBlend(const D3D11_BLEND_DESC& d, blend_desc& out)
     return true;
 }
 
-int FindSubobject(const std::vector<pipeline_subobject>& subs, pipeline_subobject_type t)
-{
-    for (size_t s = 0; s < subs.size(); ++s)
-        if (subs[s].type == t) return (int)s;
-    return -1;
-}
-
 } // namespace
 
-ID3D12PipelineState* PsoVariantCache::BlendFromDesc(
-    reshade::api::device* dev, uint64_t src_pso, const D3D11_BLEND_DESC* bdesc, const float bf[4], bool decensor)
+ID3D12PipelineState* PsoVariantCache::BlendFromDesc(reshade::api::device* dev, uint64_t src_pso,
+    const D3D11_BLEND_DESC* bdesc, const float bf[4], bool decensor,
+    const D3D11_INPUT_ELEMENT_DESC* elements, uint32_t elem_count, bool rfx)
 {
     if (!dev || !src_pso || !bdesc) return nullptr;
     const D3D11_RENDER_TARGET_BLEND_DESC& r = bdesc->RenderTarget[0];
@@ -157,19 +239,23 @@ ID3D12PipelineState* PsoVariantCache::BlendFromDesc(
     }
     const std::string cmode = std::string(cop) + " " + csrc + " " + cdst;
     const std::string amode = std::string(aop) + " " + asrc + " " + adst;
-    return Blend(dev, src_pso, cmode, amode, bf, decensor);
+    return Blend(dev, src_pso, cmode, amode, bf, decensor, elements, elem_count, rfx);
 }
 
 ID3D12PipelineState* PsoVariantCache::Blend(reshade::api::device* dev, uint64_t src_pso, const std::string& blend_mode,
-    const std::string& alpha_mode, const float bf[4], bool decensor)
+    const std::string& alpha_mode, const float bf[4], bool decensor,
+    const D3D11_INPUT_ELEMENT_DESC* elements, uint32_t elem_count, bool rfx)
 {
     if (!dev || !src_pso || blend_mode.empty()) return nullptr;
     const bool dbg = g_rfx_toggles.blend_debug_zero;
     uint64_t bkey = Fnv1a64(blend_mode.data(), blend_mode.size(), dbg ? 0xD000000000000001ULL : kFnv64Basis);
     bkey = (bkey ^ 0x5bd1e995u) * kFnv64Prime;
     bkey = Fnv1a64(alpha_mode.data(), alpha_mode.size(), bkey);
-    const CodeBlob dps = decensor ? g_patched_ps.Decensored(src_pso) : nullptr;
-    uint64_t key = src_pso ^ (bkey * 2654435761ULL) ^ (dps ? 0x9E3779B97F4A7C15ULL : 0);
+    const uint64_t lkey = (elements && elem_count) ? HashInputElements(elements, elem_count) : 0ULL;
+    uint64_t ps_salt = 0;
+    const CodeBlob dps = ResolvePsVariant(src_pso, decensor, rfx, ps_salt);
+    if (rfx && !dps) return nullptr;
+    const uint64_t key = src_pso ^ (bkey * 2654435761ULL) ^ (lkey * 0x517CC1B727220A95ULL) ^ ps_salt;
     {
         std::lock_guard l(blend_mutex_);
         auto it = blend_.find(key);
@@ -202,8 +288,27 @@ ID3D12PipelineState* PsoVariantCache::Blend(reshade::api::device* dev, uint64_t 
                 !have ? "no clone of this PSO (created before the addon)" : "the clone has no blend_state subobject");
         return nullptr;
     }
+    std::vector<input_element> ie;
+    if (elements && elem_count && !PatchInputLayout(subs, elements, elem_count, ie)) {
+        bool inserted = false;
+        {
+            std::lock_guard lv(blend_mutex_);
+            inserted = blend_.emplace(key, PsoVariant{ src_pso, nullptr }).second;
+        }
+        if (inserted)
+            logger::write("CUSTOMBLEND-ILAYOUT-MISS src=%llx elems=%u: the PSO's input layout does not match the override -- no combined variant",
+                (unsigned long long)src_pso, elem_count);
+        return nullptr;
+    }
+    const int rat = FindSubobject(subs, pipeline_subobject_type::render_target_formats);
+    const format* const rtf = (rat >= 0 && subs[rat].data) ? static_cast<const format*>(subs[rat].data) : nullptr;
+    const uint32_t rtf_count = rtf ? subs[rat].count : 8u;
     auto bd = std::make_unique<blend_desc>(*static_cast<const blend_desc*>(subs[bidx].data));
     for (int rt = 0; rt < 8; ++rt) {
+        if (RtBlendBlocked(rt, rtf, rtf_count)) {
+            bd->blend_enable[rt] = false;
+            continue;
+        }
         bd->blend_enable[rt] = true;
         if (dbg) { // SHOW BACKGROUND: result = 0*src + 1*dst = whatever is behind the piece
             bd->color_blend_op[rt] = bd->alpha_blend_op[rt] = blend_op::add;
@@ -213,9 +318,15 @@ ID3D12PipelineState* PsoVariantCache::Blend(reshade::api::device* dev, uint64_t 
             bd->color_blend_op[rt] = BlendOpFromTok(ctoks[0]);
             bd->source_color_blend_factor[rt] = BlendFacFromTok(ctoks[1], false);
             bd->dest_color_blend_factor[rt] = BlendFacFromTok(ctoks[2], false);
-            bd->alpha_blend_op[rt] = BlendOpFromTok(atoks[0]);
-            bd->source_alpha_blend_factor[rt] = BlendFacFromTok(atoks[1], true);
-            bd->dest_alpha_blend_factor[rt] = BlendFacFromTok(atoks[2], true);
+            if (rtf && rtf_count >= 4 && rt >= 1) {
+                bd->alpha_blend_op[rt] = blend_op::add;
+                bd->source_alpha_blend_factor[rt] = blend_factor::one;
+                bd->dest_alpha_blend_factor[rt] = blend_factor::zero;
+            } else {
+                bd->alpha_blend_op[rt] = BlendOpFromTok(atoks[0]);
+                bd->source_alpha_blend_factor[rt] = BlendFacFromTok(atoks[1], true);
+                bd->dest_alpha_blend_factor[rt] = BlendFacFromTok(atoks[2], true);
+            }
         }
     }
     // blend_constant here is informational only -- D3D12 takes the factor from OMSetBlendFactor, not the PSO.
@@ -242,10 +353,10 @@ ID3D12PipelineState* PsoVariantCache::Blend(reshade::api::device* dev, uint64_t 
         blend_[key] = PsoVariant{ src_pso, variant };
     }
     logger::write(
-        "CUSTOMBLEND variant src=%llx blend='%s' alpha='%s' iniFactor=%.2f,%.2f,%.2f,%.2f (factor dynamic) decensored=%d -> %s, "
+        "CUSTOMBLEND variant src=%llx blend='%s' alpha='%s' iniFactor=%.2f,%.2f,%.2f,%.2f (factor dynamic) decensored=%d elems=%u rfx=%d -> %s, "
         "built on the drawing thread in %.1f ms",
-        src_pso, blend_mode.c_str(), alpha_mode.empty() ? "(=color)" : alpha_mode.c_str(), bf[0], bf[1], bf[2], bf[3],
-        (int)(dps != nullptr), variant ? "OK" : "FAILED(create)", ms);
+        (unsigned long long)src_pso, blend_mode.c_str(), alpha_mode.empty() ? "(=color)" : alpha_mode.c_str(), bf[0], bf[1], bf[2], bf[3],
+        (int)(dps != nullptr), elem_count, (int)rfx, variant ? "OK" : "FAILED(create)", ms);
     return variant;
 }
 
@@ -253,21 +364,10 @@ ID3D12PipelineState* PsoVariantCache::InputLayout(reshade::api::device* dev, uin
     const D3D11_INPUT_ELEMENT_DESC* elements, uint32_t count, bool decensor, bool rfx)
 {
     if (!dev || !src_pso || !elements || !count) return nullptr;
-    uint64_t lkey = kFnv64Basis;
-    for (uint32_t i = 0; i < count; ++i) {
-        const D3D11_INPUT_ELEMENT_DESC& e = elements[i];
-        if (e.SemanticName) lkey = Fnv1a64(e.SemanticName, strlen(e.SemanticName), lkey);
-        const uint32_t v[3] = { e.SemanticIndex, (uint32_t)e.Format, e.AlignedByteOffset };
-        lkey = Fnv1a64(v, sizeof v, lkey);
-    }
-    const CodeBlob dps = rfx ? g_patched_ps.Rfx(src_pso, decensor)
-        : decensor           ? g_patched_ps.Decensored(src_pso)
-                             : nullptr;
+    const uint64_t lkey = HashInputElements(elements, count);
+    uint64_t salt = 0;
+    const CodeBlob dps = ResolvePsVariant(src_pso, decensor, rfx, salt);
     if (rfx && !dps) return nullptr;
-    const uint64_t salt = !dps ? 0
-        : !rfx                 ? 0x9E3779B97F4A7C15ULL
-        : decensor             ? 0xD6E8FEB86659FD93ULL
-                               : 0xC2B2AE3D27D4EB4FULL;
     const uint64_t key = src_pso ^ (lkey * 2654435761ULL) ^ salt;
     {
         std::lock_guard l(layout_mutex_);
@@ -279,24 +379,12 @@ ID3D12PipelineState* PsoVariantCache::InputLayout(reshade::api::device* dev, uin
     const char* why = nullptr;
     int bidx = -1;
     if (!g_pso_clones.Shallow(src_pso, layout, subs, bidx)) why = "no clone of this PSO (created before the addon)";
-    int il = -1;
-    for (size_t s = 0; !why && s < subs.size(); ++s)
-        if (subs[s].type == pipeline_subobject_type::input_layout) il = (int)s;
-    if (!why && (il < 0 || subs[il].count != count || !subs[il].data))
-        why = "the PSO's input layout is not the one the override was made from";
     std::vector<input_element> ie;
+    if (!why && !PatchInputLayout(subs, elements, count, ie))
+        why = "the PSO's input layout is not the one the override was made from";
     ID3D12PipelineState* variant = nullptr;
     double ms = 0.0;
     if (!why) {
-        const auto* src = static_cast<const input_element*>(subs[il].data);
-        ie.assign(src, src + count);
-        for (uint32_t i = 0; i < count; ++i) {
-            ie[i].semantic = elements[i].SemanticName;
-            ie[i].semantic_index = elements[i].SemanticIndex;
-            ie[i].format = (format)elements[i].Format;
-            ie[i].offset = elements[i].AlignedByteOffset;
-        }
-        subs[il].data = ie.data();
         shader_desc dps_desc{};
         if (dps) SwapPixelShader(subs, dps, dps_desc);
         reshade::api::pipeline out = { 0 };
@@ -370,9 +458,23 @@ ID3D12PipelineState* PsoVariantCache::ModShaders(device* dev, uint64_t src_pso, 
     }
     blend_desc bd;
     if (!why && mp.blend) {
+        format mod_rtf[8] = {};
+        const format* ovr_rtf = nullptr;
+        uint32_t ovr_rtf_count = 8;
+        if (mp.own_targets) {
+            ovr_rtf_count = mp.num_rt < 8 ? mp.num_rt : 8;
+            for (uint32_t i = 0; i < ovr_rtf_count; ++i) mod_rtf[i] = (format)mp.rt_format[i];
+            ovr_rtf = mod_rtf;
+        } else {
+            const int rat = FindSubobject(subs, pipeline_subobject_type::render_target_formats);
+            if (rat >= 0 && subs[rat].data) {
+                ovr_rtf = static_cast<const format*>(subs[rat].data);
+                ovr_rtf_count = subs[rat].count;
+            }
+        }
         const int at = FindSubobject(subs, pipeline_subobject_type::blend_state);
         if (at >= 0 && subs[at].data) bd = *static_cast<const blend_desc*>(subs[at].data);
-        if (!OverBlend(*mp.blend, bd))
+        if (!OverBlend(*mp.blend, bd, ovr_rtf, ovr_rtf_count))
             why = "a blend operation or factor with no DX12 counterpart";
         else if (at >= 0)
             subs[at] = { pipeline_subobject_type::blend_state, 1, &bd };
