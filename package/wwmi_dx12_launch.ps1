@@ -275,7 +275,7 @@ $engineCvars = [ordered]@{
     "r.Streaming.MinBoost"              = "1"
     "r.Streaming.HLODStrategy"          = "0"
     "r.MipMapLODBias"                   = "0"
-    "r.D3D12.GPUTimeout"                = "0"
+    "r.D3D12.GPUTimeout"                = "1"
 }
 # As XXMI Launcher writes it for WWMI: characters keep the model mods replace out to the farthest camera.
 # Also mirror the streaming pool CVars into UserEngine.ini because UE reads ConsoleVariables there over Engine.ini.
