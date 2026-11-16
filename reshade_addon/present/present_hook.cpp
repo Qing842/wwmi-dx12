@@ -95,12 +95,18 @@ void FrameStepper::OnPresent(command_queue* queue, swapchain* sc)
     // Presents from another thread than the game's (frame generation): the game's thread steps at its own frame end, and
     // a present steps only when no frame end came for a while, and then only after the game drew.
     const uint32_t game_tid = g_frames.game_submit_tid.load(std::memory_order_relaxed);
-    const bool other_thread = g_present_toggles.frame_end_step && game_tid && game_tid != me;
+    const uint64_t game_q = g_frames.game_submit_queue.load(std::memory_order_relaxed);
+    const uint64_t pres_q = reinterpret_cast<uint64_t>(queue->get_native());
+    const bool diff_queue = game_q != 0 && game_q != pres_q;
+    const bool other_thread = g_present_toggles.frame_end_step && (diff_queue || (game_tid && game_tid != me));
     g_frames.frame_end_armed.store(other_thread, std::memory_order_relaxed);
     if (other_thread != other_thread_) {
         other_thread_ = other_thread;
-        logger::write("FRAMESTEP: presents come from %s thread -- the per-frame step runs at %s",
-            other_thread ? "another" : "the game's", other_thread ? "the game's frame end" : "the present");
+        logger::write("FRAMESTEP: presents come from %s -- the per-frame step runs at %s",
+            diff_queue         ? "a separate present queue"
+                : other_thread ? "another thread"
+                               : "the game's thread",
+            other_thread ? "the game's frame end" : "the present");
     }
     // A frame the step already ran for at its end (presents just moved to the game's thread) gets only the redraw.
     const bool stepped_at_end = g_frames.frame_end_stepped.exchange(false, std::memory_order_relaxed);
@@ -183,6 +189,12 @@ void FrameStepper::OnPresent(command_queue* queue, swapchain* sc)
         if (!g_present_toggles.skip_engine_tick) g_engine_frame.Redraw(queue, sc);
         return;
     }
+    if (diff_queue && g_present_toggles.frame_end_step) {
+        Step(queue, sc, false);
+        ModSetRef set_ref;
+        if (!g_present_toggles.skip_engine_tick) g_engine_frame.Redraw(queue, sc);
+        return;
+    }
     Step(queue, sc, true);
 }
 
@@ -201,9 +213,12 @@ void FrameStepper::Step(command_queue* queue, swapchain* sc, bool at_present)
     g_watchdogs.StartRemoval(sc);
     g_buffer_reloc.Sweep(sc->get_device());
     g_mod_textures_load.Tick();
-    g_tex_replace.Tick((ID3D12CommandQueue*)queue->get_native());
+    auto* work_q = (ID3D12CommandQueue*)queue->get_native();
+    if (const uint64_t gq = g_frames.game_submit_queue.load(std::memory_order_relaxed))
+        work_q = reinterpret_cast<ID3D12CommandQueue*>(gq);
+    g_tex_replace.Tick(work_q);
     g_tex_budget.Tick();
-    g_tex_encode_test.Tick((ID3D12CommandQueue*)queue->get_native());
+    g_tex_encode_test.Tick(work_q);
     g_tex_encoder.Tick();
     if (g_draw_toggles.wwmi_geom) {
         uint32_t gc = g_draw_stats.wwmi_geom_count.load();

@@ -23,6 +23,7 @@ cbuffer Params : register(b0) {
     uint g_idxSize;
     uint g_vbStride;
     uint g_vbExtent;
+    uint g_ibShift;
 };
 
 #define THREADS 1024u
@@ -49,19 +50,23 @@ void main(uint tid : SV_GroupIndex)
     for (uint i = tid; i < nIdx; i += THREADS) {
         uint v;
         if (g_idxSize == 2u) {
-            uint b = i * 2u;
+            uint b = g_ibShift + i * 2u;
             uint w = IB.Load(b & ~3u);
             v = (b & 2u) ? (w >> 16) : (w & 0xFFFFu);
         }
-        else                 { v = IB.Load(i * 4u); }
+        else {
+            v = IB.Load(g_ibShift + i * 4u);
+            if (v == 0xFFFFFFFFu) v = 0u;
+        }
         localMax = max(localMax, v);
     }
     InterlockedMax(gMax, localMax);
     GroupMemoryBarrierWithGroupSync();
 
     const uint maxIdx  = gMax;
-    uint vbBytes = (maxIdx + 1u) * g_vbStride;
-    vbBytes = min(vbBytes, g_vbExtent);
+    const uint maxVerts = g_vbStride > 0u ? (g_vbExtent / g_vbStride) : 0u;
+    const uint vertCount = (maxIdx >= maxVerts) ? maxVerts : (maxIdx + 1u);
+    uint vbBytes = min(vertCount * g_vbStride, g_vbExtent);
 
     // pass 2: this thread's slice of the prefix, 4-byte aligned so every Load is aligned
     const uint slice = (((vbBytes + THREADS - 1u) / THREADS) + 3u) & ~3u;

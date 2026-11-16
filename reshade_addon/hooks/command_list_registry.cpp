@@ -238,7 +238,11 @@ void on_execute_command_list(command_queue* queue, command_list* cl)
     if (g_command_lists.DrewThisRecording(cl)) {
         g_frames.game_frame_submitted.store(true, std::memory_order_relaxed);
         g_frames.game_submit_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
-        if (queue) g_frames.game_submit_queue.store(queue->get_native(), std::memory_order_relaxed);
+        if (queue) {
+            auto* const nq = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+            if (nq && nq->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT)
+                g_frames.game_submit_queue.store(queue->get_native(), std::memory_order_relaxed);
+        }
     }
 #ifdef WWMI_DEBUG
     if (g_present_log.left.load(std::memory_order_relaxed) > 0) {
@@ -289,10 +293,12 @@ void on_execute_command_list(command_queue* queue, command_list* cl)
         if (g_debug) g_frames.claim_exec_seen.fetch_add(1, std::memory_order_relaxed); // heartbeat only
     }
     if (queue && g_frames.frame_end_armed.load(std::memory_order_relaxed) && g_command_lists.EndsGameFrame(cl) &&
-        GetCurrentThreadId() == g_frames.game_submit_tid.load(std::memory_order_relaxed) &&
-        queue->get_native() == g_frames.game_submit_queue.load(std::memory_order_relaxed) &&
-        GetCurrentThreadId() != g_frames.presenter_tid.load(std::memory_order_relaxed))
-        FrameEndStepGuarded(queue);
+        queue->get_native() == g_frames.game_submit_queue.load(std::memory_order_relaxed)) {
+        const void* const qn = reinterpret_cast<const void*>(queue->get_native());
+        const void* const pq = g_frames.present_queue.load(std::memory_order_relaxed);
+        if ((pq && qn != pq) || GetCurrentThreadId() != g_frames.presenter_tid.load(std::memory_order_relaxed))
+            FrameEndStepGuarded(queue);
+    }
     if (!g_debug) return;
     if (queue) {
         auto* nl = reinterpret_cast<ID3D12CommandList*>(cl->get_native());

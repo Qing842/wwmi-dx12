@@ -147,7 +147,7 @@ void on_barrier(command_list* cmd_list, uint32_t count, const resource* res,
     CmdBlock* const blk = g_command_lists.Block(cmd_list);
     for (uint32_t i = 0; i < count; ++i)
         if (res[i].handle) {
-            if (blk && new_s[i] == resource_usage::general &&
+            if (blk && (new_s[i] == resource_usage::general || new_s[i] == resource_usage::present) &&
                 g_frames.frame_end_armed.load(std::memory_order_relaxed) && IsBackBufferSized(cmd_list, res[i]))
                 blk->frame_end_gen = blk->gen;
 #ifdef WWMI_DEBUG
@@ -252,6 +252,7 @@ void on_destroy_resource(device*, resource res)
     // Recorded BEFORE it is forgotten: this is the only moment the handle is known to have been ours.
     if (g_resources.Forget(res.handle, &gone_va, &gone_bytes)) MorphDump::NoteResourceErased(res.handle);
     g_recognition.ForgetCharMeshVb0(gone_va, gone_bytes); // a learned character VB0 dies with its buffer
+    IbHash::ForgetResource(reinterpret_cast<ID3D12Resource*>(res.handle));
     IbHash::ForgetRange(gone_va, gone_bytes); // and so do the mesh hashes taken inside it
     g_recognition.IbAnchorForget(gone_va, gone_bytes); // and the index-buffer anchor learned inside it
     g_rt_rings.ForgetRange(gone_va, gone_bytes); // and the RT skin rings inside it

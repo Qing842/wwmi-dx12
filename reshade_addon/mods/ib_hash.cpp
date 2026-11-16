@@ -44,8 +44,15 @@ struct Job {
     uint32_t idx_size;
     uint32_t vb_off;
     uint32_t vb_stride;
+    uint64_t ib_va;
     uint64_t vb_va;
 };
+bool JobHitsRange(const Job& j, uint64_t va, uint64_t end)
+{
+    const bool vb_hit = j.vb_va >= va && j.vb_va < end;
+    const bool ib_hit = j.ib_va < end && va < j.ib_va + j.ib_bytes;
+    return vb_hit || ib_hit;
+}
 std::vector<Job> g_pending;
 std::vector<Job> g_small_pending; // LookupSmall's jobs: recorded when g_pending is empty
 std::unordered_set<uint64_t> g_small_queued; // their vb_va
@@ -66,6 +73,47 @@ thread_local LookupMemo t_memo[1024] = {};
 void StoreLocked(uint64_t vb_va, const Cached& c)
 {
     if (!g_cache.insert_or_assign(vb_va, c).second) g_cache_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+bool ValidAlignment(uint64_t ib_va, uint64_t vb_va, uint32_t idx_size)
+{
+    return ib_va && vb_va && (vb_va & 3u) == 0 && (ib_va & 1u) == 0 && !(idx_size == 4u && (ib_va & 3u) != 0);
+}
+template <class Pred> bool AnyJobMatchesLocked(Pred&& pred)
+{
+    if (g_inflight && pred(g_inflight_job)) return true;
+    for (const Job& j : g_pending)
+        if (pred(j)) return true;
+    for (const Job& j : g_small_pending)
+        if (pred(j)) return true;
+    return false;
+}
+template <class Pred> void PurgeJobsLocked(Pred&& pred, std::vector<Job>& dropped)
+{
+    if (g_inflight && pred(g_inflight_job)) g_inflight_stale = true;
+    for (size_t i = 0; i < g_pending.size();) {
+        if (pred(g_pending[i])) {
+            dropped.push_back(g_pending[i]);
+            g_pending.erase(g_pending.begin() + i);
+        } else {
+            ++i;
+        }
+    }
+    for (size_t i = 0; i < g_small_pending.size();) {
+        if (pred(g_small_pending[i])) {
+            dropped.push_back(g_small_pending[i]);
+            g_small_queued.erase(g_small_pending[i].vb_va);
+            g_small_pending.erase(g_small_pending.begin() + i);
+        } else {
+            ++i;
+        }
+    }
+}
+void ReleaseJobs(const std::vector<Job>& dropped)
+{
+    for (const Job& j : dropped) {
+        j.ib->Release();
+        j.vb->Release();
+    }
 }
 // one hash in flight at a time (NON-BLOCKING: dispatch, read the result a later present -- never stall).
 bool g_inflight = false;
@@ -164,7 +212,7 @@ bool Init(ID3D12Device* dev)
     D3D12_ROOT_PARAMETER rp[4] = {};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[0].Constants.ShaderRegister = 0;
-    rp[0].Constants.Num32BitValues = 4;
+    rp[0].Constants.Num32BitValues = 5;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     rp[1].Descriptor.ShaderRegister = 0; // t0 = IB
     rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -218,9 +266,11 @@ bool Init(ID3D12Device* dev)
 uint32_t Lookup(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes, uint32_t idx_size, ID3D12Resource* vb_res,
     uint32_t vb_off, uint32_t vb_stride, bool grow)
 {
-    if (!ib_res || !vb_res || !ib_bytes || !idx_size || !vb_stride) return 0;
-    if (!Init(g_addon.d3d12_device)) return 0;
+    if (!ib_res || !vb_res || !ib_bytes || (idx_size != 2u && idx_size != 4u) || !vb_stride) return 0;
+    const uint64_t ib_va = ib_res->GetGPUVirtualAddress() + ib_off;
     uint64_t vb_va = vb_res->GetGPUVirtualAddress() + vb_off; // UNIQUE per char (pooled VBs)
+    if (!ValidAlignment(ib_va, vb_va, idx_size)) return 0;
+    if (!Init(g_addon.d3d12_device)) return 0;
     LookupMemo& m = t_memo[((vb_va >> 8) ^ (vb_va >> 20)) & 1023];
     const uint32_t gen = g_cache_gen.load(std::memory_order_acquire);
     if (m.vb_va == vb_va && m.gen == gen && !(grow && m.hash && ib_bytes > m.ib_bytes)) return m.hash;
@@ -247,7 +297,7 @@ uint32_t Lookup(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes, uint
     if (g_pending.size() < 32) {
         ib_res->AddRef();
         vb_res->AddRef();
-        g_pending.push_back({ ib_res, vb_res, ib_off, ib_bytes, idx_size, vb_off, vb_stride, vb_va });
+        g_pending.push_back({ ib_res, vb_res, ib_off, ib_bytes, idx_size, vb_off, vb_stride, ib_va, vb_va });
     }
     return meanwhile;
 }
@@ -255,9 +305,11 @@ uint32_t Lookup(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes, uint
 uint32_t LookupSmall(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes, uint32_t idx_size,
     ID3D12Resource* vb_res, uint32_t vb_off, uint32_t vb_stride)
 {
-    if (!ib_res || !vb_res || !ib_bytes || !idx_size || !vb_stride) return 0;
-    if (!Init(g_addon.d3d12_device)) return 0;
+    if (!ib_res || !vb_res || !ib_bytes || (idx_size != 2u && idx_size != 4u) || !vb_stride) return 0;
+    const uint64_t ib_va = ib_res->GetGPUVirtualAddress() + ib_off;
     const uint64_t vb_va = vb_res->GetGPUVirtualAddress() + vb_off;
+    if (!ValidAlignment(ib_va, vb_va, idx_size)) return 0;
+    if (!Init(g_addon.d3d12_device)) return 0;
     LookupMemo& m = t_memo[((vb_va >> 8) ^ (vb_va >> 20)) & 1023];
     const uint32_t gen = g_cache_gen.load(std::memory_order_acquire);
     if (m.vb_va == vb_va && m.gen == gen && !(ib_off == 0 && m.hash && ib_bytes > m.ib_bytes)) return m.hash;
@@ -301,7 +353,7 @@ uint32_t LookupSmall(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes,
     if (g_small_pending.size() >= 128) return meanwhile;
     ib_res->AddRef();
     vb_res->AddRef();
-    g_small_pending.push_back({ ib_res, vb_res, ib_off, ib_bytes, idx_size, vb_off, vb_stride, vb_va });
+    g_small_pending.push_back({ ib_res, vb_res, ib_off, ib_bytes, idx_size, vb_off, vb_stride, ib_va, vb_va });
     g_small_queued.insert(vb_va);
     return meanwhile;
 }
@@ -309,44 +361,37 @@ uint32_t LookupSmall(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes,
 void ForgetRange(uint64_t va, uint64_t bytes)
 {
     if (!va || !bytes) return;
+    const uint64_t end = va + bytes;
+    const auto hits = [va, end](const Job& j) { return JobHitsRange(j, va, end); };
     {
         std::shared_lock l(g_mtx);
-        bool hit = g_cache.lower_bound(va) != g_cache.lower_bound(va + bytes) ||
-            (g_inflight && g_inflight_job.vb_va >= va && g_inflight_job.vb_va < va + bytes);
-        for (size_t i = 0; i < g_pending.size() && !hit; ++i)
-            hit = g_pending[i].vb_va >= va && g_pending[i].vb_va < va + bytes;
-        for (size_t i = 0; i < g_small_pending.size() && !hit; ++i)
-            hit = g_small_pending[i].vb_va >= va && g_small_pending[i].vb_va < va + bytes;
+        const bool hit = g_cache.lower_bound(va) != g_cache.lower_bound(end) || AnyJobMatchesLocked(hits);
         if (!hit) return;
     }
     std::vector<Job> dropped;
     {
         std::unique_lock l(g_mtx);
-        g_cache.erase(g_cache.lower_bound(va), g_cache.lower_bound(va + bytes));
+        g_cache.erase(g_cache.lower_bound(va), g_cache.lower_bound(end));
         g_cache_gen.fetch_add(1, std::memory_order_acq_rel);
-        if (g_inflight && g_inflight_job.vb_va >= va && g_inflight_job.vb_va < va + bytes) g_inflight_stale = true;
-        for (size_t i = 0; i < g_pending.size();) {
-            if (g_pending[i].vb_va >= va && g_pending[i].vb_va < va + bytes) {
-                dropped.push_back(g_pending[i]);
-                g_pending.erase(g_pending.begin() + i);
-            } else {
-                ++i;
-            }
-        }
-        for (size_t i = 0; i < g_small_pending.size();) {
-            if (g_small_pending[i].vb_va >= va && g_small_pending[i].vb_va < va + bytes) {
-                dropped.push_back(g_small_pending[i]);
-                g_small_queued.erase(g_small_pending[i].vb_va);
-                g_small_pending.erase(g_small_pending.begin() + i);
-            } else {
-                ++i;
-            }
-        }
+        PurgeJobsLocked(hits, dropped);
     }
-    for (const Job& j : dropped) {
-        j.ib->Release();
-        j.vb->Release();
+    ReleaseJobs(dropped);
+}
+
+void ForgetResource(ID3D12Resource* res)
+{
+    if (!res) return;
+    const auto hits = [res](const Job& j) { return j.ib == res || j.vb == res; };
+    {
+        std::shared_lock l(g_mtx);
+        if (!AnyJobMatchesLocked(hits)) return;
     }
+    std::vector<Job> dropped;
+    {
+        std::unique_lock l(g_mtx);
+        PurgeJobsLocked(hits, dropped);
+    }
+    ReleaseJobs(dropped);
 }
 
 void DrainQueue()
@@ -447,9 +492,14 @@ bool Record(ID3D12GraphicsCommandList* cl)
             return false;
         }
     }
-    uint64_t ibW = j.ib->GetDesc().Width;
-    uint64_t vbW = j.vb->GetDesc().Width;
-    if ((uint64_t)j.ib_off + j.ib_bytes > ibW || j.vb_off >= vbW) { // bad range -> cache 0, skip
+    const uint64_t ibW = j.ib->GetDesc().Width;
+    const uint64_t vbW = j.vb->GetDesc().Width;
+    const uint64_t ib_va = j.ib->GetGPUVirtualAddress() + j.ib_off;
+    const uint64_t vb_va = j.vb->GetGPUVirtualAddress() + j.vb_off;
+    const uint32_t ib_shift = (uint32_t)(ib_va & 3u);
+    const uint64_t ib_aligned_off = j.ib_off >= ib_shift ? (uint64_t)(j.ib_off - ib_shift) : ibW + 1;
+    const uint64_t ib_read_end = ib_aligned_off + (((uint64_t)ib_shift + j.ib_bytes + 3ull) & ~3ull);
+    if (!ValidAlignment(ib_va, vb_va, j.idx_size) || ib_read_end > ibW || j.vb_off >= vbW) { // bad range -> cache 0, skip
         {
             std::unique_lock l(g_mtx);
             StoreLocked(j.vb_va, Cached{ 0, j.ib_bytes });
@@ -484,11 +534,11 @@ bool Record(ID3D12GraphicsCommandList* cl)
     cl->SetPipelineState(g_pso.Get());
     cl->SetComputeRootSignature(g_rs.Get());
     const uint64_t vb_ext = vbW - j.vb_off; // the view's extent: the shader clamps to it
-    uint32_t consts[4] = { j.ib_bytes, j.idx_size, j.vb_stride,
-        vb_ext > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)vb_ext };
-    cl->SetComputeRoot32BitConstants(0, 4, consts, 0);
-    cl->SetComputeRootShaderResourceView(1, j.ib->GetGPUVirtualAddress() + j.ib_off); // t0 IB
-    cl->SetComputeRootShaderResourceView(2, j.vb->GetGPUVirtualAddress() + j.vb_off); // t1 VB
+    uint32_t consts[5] = { j.ib_bytes, j.idx_size, j.vb_stride,
+        vb_ext > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)vb_ext, ib_shift };
+    cl->SetComputeRoot32BitConstants(0, 5, consts, 0);
+    cl->SetComputeRootShaderResourceView(1, ib_va - ib_shift); // t0 IB (4-byte aligned)
+    cl->SetComputeRootShaderResourceView(2, vb_va); // t1 VB (4-byte aligned)
     cl->SetComputeRootUnorderedAccessView(3, g_out->GetGPUVirtualAddress());
     const int gt = g_gpu_timer.Begin(cl, GT_IbHash);
     void* const hp = HotPath::GpuBracketBegin(cl, GT_IbHash);

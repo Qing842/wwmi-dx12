@@ -344,7 +344,7 @@ void TexGc::Decide(std::vector<Item>& items)
             }
         }
         while (tight_ && through && now >= tight_ms_ + kOnScreenMs && projected > target &&
-            lowered_drawn < kMaxLowerDrawn && projected > (int64_t)(1280ull * kMb)) {
+            lowered_drawn < kMaxLowerDrawn && projected > (int64_t)(384ull * kMb)) {
             Item* pick = nullptr;
             for (size_t i = 0; i < items.size(); ++i) {
                 Item& it = items[i];

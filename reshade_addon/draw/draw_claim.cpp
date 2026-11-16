@@ -244,9 +244,11 @@ uint32_t LookupSmallFromDraw(const DrawArgs& da, uint32_t* out_vstride = nullptr
     }
     const int64_t vb_off =
         !vbr ? -1 : (int64_t)(vbva - vbr->GetGPUVirtualAddress()) + (int64_t)da.vertex_offset * vstride;
-    const char* const refused = !ibr || !vbr || !vstride ? "no buffers"
-        : vb_off < 0                                     ? "base vertex before the buffer"
-                                                         : nullptr;
+    const char* const refused = !ibr || !vbr || !vstride      ? "no buffers"
+        : (vstride & 3u) != 0 || vstride < 12 || vstride > 64 ? "non-position stride"
+        : da.instance_count > 4                               ? "instanced batch"
+        : vb_off < 0                                          ? "base vertex before the buffer"
+                                                              : nullptr;
     if (out_vstride) *out_vstride = vstride;
     if (refused) {
 #ifdef WWMI_DEBUG
@@ -312,7 +314,8 @@ bool DispatchDrawnMeshOverrides(
 bool RunSmallMeshOverrides(const DrawArgs& da)
 {
     const bool menu_shape = g_settings.decensor && da.index_count == kMenuBackdropIndices;
-    if (da.index_count >= 256 || (!menu_shape && !g_recognition.SmallMeshAny() && !g_recognition.ModelHashAny()))
+    if (da.index_count < 24 || da.index_count >= 256 ||
+        (!menu_shape && !g_recognition.SmallMeshAny() && !g_recognition.ModelHashAny()))
         return false;
     uint32_t vstride = 0;
     const uint32_t got = LookupSmallFromDraw(da, &vstride);
@@ -449,7 +452,8 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                         }
                     }
                 }
-            } else if (!skinned && (skip_any || model_any || small_any)) {
+            } else if (!skinned && first_index == 0 && da.instance_count == 1 &&
+                (skip_any || (draw_rt.rtv_count > 0 && (model_any || small_any)))) {
                 uint32_t vstride = 0;
                 const uint32_t got = LookupSmallFromDraw(da, &vstride);
                 if (got) {

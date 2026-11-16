@@ -538,9 +538,12 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $problem) {
-        Write-Host "Game starting. This window minimizes and closes by itself in a minute, once the game has read its settings."
+        Write-Host "Game starting. This window minimizes and closes by itself in 3 minutes, once the game has loaded into the world."
         Hide-LauncherWindow
-        Start-Sleep -Seconds 60
+        $tHold = Get-Date
+        while ((Test-GameRunning) -and (((Get-Date) - $tHold).TotalSeconds -lt 180)) {
+            Start-Sleep -Seconds 2
+        }
     }
 }
 finally {

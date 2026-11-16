@@ -38,6 +38,17 @@ using namespace reshade::api;
 
 EngineFrame g_engine_frame;
 
+namespace {
+ID3D12CommandQueue* GameQueueOr(ID3D12CommandQueue* fallback)
+{
+    if (const uint64_t sq = g_frames.game_submit_queue.load(std::memory_order_relaxed))
+        return reinterpret_cast<ID3D12CommandQueue*>(sq);
+    if (const void* gq = g_frames.claim_exec_queue.load(std::memory_order_relaxed))
+        return reinterpret_cast<ID3D12CommandQueue*>(const_cast<void*>(gq));
+    return fallback;
+}
+} // namespace
+
 bool EngineFrame::Pass::Init(ID3D12Device* dev)
 {
     if (ready) return true;
@@ -337,11 +348,12 @@ void EngineFrame::PresentPasses(Frame& f, std::vector<ChainProf>& cp)
 {
     PROF(PROF_ET_Lists);
     {
-        ID3D12CommandQueue* qs[3] = { (ID3D12CommandQueue*)f.queue->get_native(),
+        ID3D12CommandQueue* qs[4] = { (ID3D12CommandQueue*)f.queue->get_native(),
+            reinterpret_cast<ID3D12CommandQueue*>(g_frames.game_submit_queue.load(std::memory_order_relaxed)),
             reinterpret_cast<ID3D12CommandQueue*>(
                 const_cast<void*>(g_frames.claim_exec_queue.load(std::memory_order_relaxed))),
             reinterpret_cast<ID3D12CommandQueue*>(g_frames.present_queue.load(std::memory_order_relaxed)) };
-        GpuProgressTick((ID3D12Device*)f.sc->get_device()->get_native(), qs, 3);
+        GpuProgressTick((ID3D12Device*)f.sc->get_device()->get_native(), qs, 4);
     }
 #ifdef WWMI_DEBUG
     if (g_tex_trace.Armed()) g_tex_trace.Line("present: the [Present] pre pass runs");
@@ -396,11 +408,7 @@ void EngineFrame::SubmitList(Frame& f)
     PROF(PROF_ET_Submit);
     auto* dev12 = (ID3D12Device*)f.sc->get_device()->get_native();
     auto* q12 = (ID3D12CommandQueue*)f.queue->get_native();
-    ID3D12CommandQueue* subq = q12;
-    if (g_present_toggles.on_game_queue) {
-        const void* gq = g_frames.claim_exec_queue.load(std::memory_order_relaxed);
-        if (gq) subq = reinterpret_cast<ID3D12CommandQueue*>(const_cast<void*>(gq));
-    }
+    ID3D12CommandQueue* subq = (g_present_toggles.on_game_queue || !f.bb12) ? GameQueueOr(q12) : q12;
     {
         const int now = (subq == q12) ? 0 : 1;
         if (now != x18_last_) {
@@ -492,12 +500,13 @@ void EngineFrame::Tick(command_queue* queue, swapchain* sc, bool bind_back_buffe
         // WWMI's first-run guide is dismissed with F10, which is gated off: never let it open.
         if (PortApi::GetVarNs(L"WWMIv1", L"first_run", 0.f) != 0.f) PortApi::SetVarNs(L"WWMIv1", L"first_run", 0.f);
         PresentPasses(f, cp);
-        if (f.cl)
-            g_skeleton_dump.ChainTick(
-                (ID3D12Device*)sc->get_device()->get_native(), f.cl, (ID3D12CommandQueue*)queue->get_native());
-        if (f.cl)
-            g_skeleton_dump.MergedTick(
-                (ID3D12Device*)sc->get_device()->get_native(), f.cl, (ID3D12CommandQueue*)queue->get_native());
+        if (f.cl) {
+            auto* const dev12 = (ID3D12Device*)sc->get_device()->get_native();
+            auto* const raw_q = (ID3D12CommandQueue*)queue->get_native();
+            ID3D12CommandQueue* const dump_q = !f.bb12 ? GameQueueOr(raw_q) : raw_q;
+            g_skeleton_dump.ChainTick(dev12, f.cl, dump_q);
+            g_skeleton_dump.MergedTick(dev12, f.cl, dump_q);
+        }
 
         for (const ChainProf& c : cp) {
             const float od_post = PortApi::GetVarNs(c.ns.c_str(), L"object_detected", -1.f);
