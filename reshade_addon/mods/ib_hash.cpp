@@ -78,6 +78,11 @@ bool ValidAlignment(uint64_t ib_va, uint64_t vb_va, uint32_t idx_size)
 {
     return ib_va && vb_va && (vb_va & 3u) == 0 && (ib_va & 1u) == 0 && !(idx_size == 4u && (ib_va & 3u) != 0);
 }
+// one hash in flight at a time (NON-BLOCKING: dispatch, read the result a later present -- never stall).
+bool g_inflight = false;
+UINT64 g_inflight_fv = 0;
+Job g_inflight_job = {};
+bool g_inflight_stale = false; // its region was rewritten while it computed: do not cache
 template <class Pred> bool AnyJobMatchesLocked(Pred&& pred)
 {
     if (g_inflight && pred(g_inflight_job)) return true;
@@ -115,11 +120,6 @@ void ReleaseJobs(const std::vector<Job>& dropped)
         j.vb->Release();
     }
 }
-// one hash in flight at a time (NON-BLOCKING: dispatch, read the result a later present -- never stall).
-bool g_inflight = false;
-UINT64 g_inflight_fv = 0;
-Job g_inflight_job = {};
-bool g_inflight_stale = false; // its region was rewritten while it computed: do not cache
 bool g_recorded = false; // Record wrote a dispatch this frame; Submitted names its fence
 LARGE_INTEGER g_inflight_t0 = {};
 uint64_t g_inflight_ext = 0; // vb view extent (vbW - vb_off) of the in-flight job

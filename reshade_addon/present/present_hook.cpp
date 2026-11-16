@@ -96,7 +96,7 @@ void FrameStepper::OnPresent(command_queue* queue, swapchain* sc)
     // a present steps only when no frame end came for a while, and then only after the game drew.
     const uint32_t game_tid = g_frames.game_submit_tid.load(std::memory_order_relaxed);
     const uint64_t game_q = g_frames.game_submit_queue.load(std::memory_order_relaxed);
-    const uint64_t pres_q = reinterpret_cast<uint64_t>(queue->get_native());
+    const uint64_t pres_q = queue->get_native();
     const bool diff_queue = game_q != 0 && game_q != pres_q;
     const bool other_thread = g_present_toggles.frame_end_step && (diff_queue || (game_tid && game_tid != me));
     g_frames.frame_end_armed.store(other_thread, std::memory_order_relaxed);
