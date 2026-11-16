@@ -42,28 +42,26 @@ void ForEachVariableSlot(void (*cb)(const wchar_t* fq_name, const float* slot, v
 
 void EngineValues::Take()
 {
+    generation = g_generation;
     vars.clear();
     vars.reserve(command_list_globals.size());
-    for (const auto& kv : command_list_globals) vars.push_back(kv.second.fval);
+    for (auto& kv : command_list_globals) vars.push_back({ &kv.second.fval, kv.second.fval });
     params = G->iniParams;
     shader_runs.clear();
     shader_runs.reserve(customShaders.size());
-    for (const auto& kv : customShaders) shader_runs.emplace_back(kv.second.frame_no, kv.second.executions_this_frame);
+    for (auto& kv : customShaders)
+        shader_runs.push_back(
+            { &kv.second.frame_no, &kv.second.executions_this_frame, kv.second.frame_no, kv.second.executions_this_frame });
 }
 
 void EngineValues::PutBack() const
 {
-    size_t i = 0;
-    for (auto& kv : command_list_globals) {
-        if (i == vars.size()) break;
-        kv.second.fval = vars[i++];
-    }
+    if (generation != g_generation) return;
+    for (const VarSnap& v : vars) *v.slot = v.val;
     G->iniParams = params;
-    size_t s = 0;
-    for (auto& kv : customShaders) {
-        if (s == shader_runs.size()) break;
-        kv.second.frame_no = shader_runs[s].first;
-        kv.second.executions_this_frame = shader_runs[s++].second;
+    for (const ShaderSnap& s : shader_runs) {
+        *s.frame_no = s.saved_frame_no;
+        *s.executions = s.saved_executions;
     }
 }
 

@@ -48,9 +48,20 @@ bool DeferredPending(CustomResource* r);
 // Every variable's value, the ini params and each custom shader's runs this frame, put back after a run that is to
 // leave none of its writes (port_vars.cpp). Caller holds the engine lock across both.
 struct EngineValues {
-    std::vector<float> vars;
+    struct VarSnap {
+        float* slot;
+        float val;
+    };
+    struct ShaderSnap {
+        unsigned* frame_no;
+        int* executions;
+        unsigned saved_frame_no;
+        int saved_executions;
+    };
+    unsigned generation = ~0u;
+    std::vector<VarSnap> vars;
     std::vector<DirectX::XMFLOAT4> params;
-    std::vector<std::pair<unsigned, int>> shader_runs; // frame_no, executions_this_frame
+    std::vector<ShaderSnap> shader_runs;
     void Take();
     void PutBack() const;
 };

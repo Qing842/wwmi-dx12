@@ -201,7 +201,7 @@ std::unordered_map<const void*, std::wstring>& CustomResourceNameIndex()
 {
     static auto* m = new std::unordered_map<const void*, std::wstring>();
     static unsigned built_for = 0;
-    if (built_for != g_generation) {
+    if (built_for != g_generation || m->size() != customResources.size()) {
         built_for = g_generation;
         m->clear();
         for (auto& kv : customResources) m->emplace((const void*)&kv.second, kv.first);
