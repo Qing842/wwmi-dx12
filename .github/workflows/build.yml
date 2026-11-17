@@ -3,14 +3,61 @@ name: Build Custom Artifact
 on:
   push:
     branches: ['main']
+    paths:
+      - '.github/workflows/build.yml'
+      - '.gitmodules'
+      - '.gitattributes'
+      - 'VERSION'
+      - 'README.md'
+      - 'LICENSE'
+      - 'THIRD-PARTY-NOTICES.md'
+      - 'package.proj'
+      - 'package/**'
+      - 'reshade_addon/**'
+      - 'shaderpairs/**'
+      - 'shaders_src/**'
+      - 'third_party/**'
+      - 'migoto_engine.vcxproj'
+      - 'migoto_engine.vcxproj.filters'
+      - 'wwmi_dx12.vcxproj'
+      - 'wwmi_dx12.vcxproj.filters'
+      - 'wwmi-dx12.props'
+      - 'wwmi-dx12.sln'
+  pull_request:
+    branches: ['main']
+    paths:
+      - '.github/workflows/build.yml'
+      - '.gitmodules'
+      - '.gitattributes'
+      - 'VERSION'
+      - 'README.md'
+      - 'LICENSE'
+      - 'THIRD-PARTY-NOTICES.md'
+      - 'package.proj'
+      - 'package/**'
+      - 'reshade_addon/**'
+      - 'shaderpairs/**'
+      - 'shaders_src/**'
+      - 'third_party/**'
+      - 'migoto_engine.vcxproj'
+      - 'migoto_engine.vcxproj.filters'
+      - 'wwmi_dx12.vcxproj'
+      - 'wwmi_dx12.vcxproj.filters'
+      - 'wwmi-dx12.props'
+      - 'wwmi-dx12.sln'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: wwmi-dx12-custom-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - name: Check out this commit and its two submodules
         shell: pwsh
@@ -42,11 +89,11 @@ jobs:
           & $msbuild package.proj -m -nologo
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Upload built addon and release zip
+      - name: Upload release package for custom build
         uses: actions/upload-artifact@v4
         with:
           name: wwmi-dx12-custom-build
-          path: |
-            build_addon/wwmi_dx12.addon64
-            build_addon/release/*.zip
-          retention-days: 14
+          path: build_addon/release/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
