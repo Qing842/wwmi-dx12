@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/build.yml'
       - '.gitmodules'
+      - '.gitattributes'
       - 'VERSION'
       - 'README.md'
       - 'LICENSE'
