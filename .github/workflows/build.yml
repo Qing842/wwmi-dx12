@@ -23,6 +23,28 @@ on:
       - 'wwmi_dx12.vcxproj.filters'
       - 'wwmi-dx12.props'
       - 'wwmi-dx12.sln'
+  pull_request:
+    branches: ['main']
+    paths:
+      - '.github/workflows/build.yml'
+      - '.gitmodules'
+      - '.gitattributes'
+      - 'VERSION'
+      - 'README.md'
+      - 'LICENSE'
+      - 'THIRD-PARTY-NOTICES.md'
+      - 'package.proj'
+      - 'package/**'
+      - 'reshade_addon/**'
+      - 'shaderpairs/**'
+      - 'shaders_src/**'
+      - 'third_party/**'
+      - 'migoto_engine.vcxproj'
+      - 'migoto_engine.vcxproj.filters'
+      - 'wwmi_dx12.vcxproj'
+      - 'wwmi_dx12.vcxproj.filters'
+      - 'wwmi-dx12.props'
+      - 'wwmi-dx12.sln'
   workflow_dispatch:
 
 permissions:
