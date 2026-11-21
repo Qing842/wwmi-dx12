@@ -17,6 +17,7 @@
 #include <vector>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <atomic>
 
@@ -55,10 +56,11 @@ bool JobHitsRange(const Job& j, uint64_t va, uint64_t end)
 }
 std::vector<Job> g_pending;
 std::vector<Job> g_small_pending; // LookupSmall's jobs: recorded when g_pending is empty
-std::unordered_set<uint64_t> g_small_queued; // their vb_va
+std::unordered_map<uint64_t, uint32_t> g_small_queued; // their vb_va -> queued ib_bytes
 struct Cached {
     uint32_t hash;
     uint32_t ib_bytes; // the index extent the hash was taken over
+    uint64_t ib_va;
 };
 std::map<uint64_t, Cached> g_cache;
 std::atomic<uint32_t> g_cache_gen{ 1 };
@@ -66,6 +68,7 @@ struct LookupMemo {
     uint64_t vb_va;
     uint32_t hash;
     uint32_t ib_bytes;
+    uint64_t ib_va;
     uint32_t gen;
 };
 thread_local LookupMemo t_memo[1024] = {};
@@ -280,7 +283,7 @@ uint32_t Lookup(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes, uint
         auto it = g_cache.find(vb_va);
         const bool further = grow && it != g_cache.end() && it->second.hash && ib_bytes > it->second.ib_bytes;
         if (it != g_cache.end() && !further) {
-            m = LookupMemo{ vb_va, it->second.hash, it->second.ib_bytes, gen };
+            m = LookupMemo{ vb_va, it->second.hash, it->second.ib_bytes, it->second.ib_va, gen };
             return it->second.hash;
         }
         meanwhile = further ? it->second.hash : 0;
@@ -312,40 +315,45 @@ uint32_t LookupSmall(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes,
     if (!Init(g_addon.d3d12_device)) return 0;
     LookupMemo& m = t_memo[((vb_va >> 8) ^ (vb_va >> 20)) & 1023];
     const uint32_t gen = g_cache_gen.load(std::memory_order_acquire);
-    if (m.vb_va == vb_va && m.gen == gen && !(ib_off == 0 && m.hash && ib_bytes > m.ib_bytes)) return m.hash;
+    if (m.vb_va == vb_va && m.gen == gen && !(m.ib_va == ib_va && m.hash && ib_bytes > m.ib_bytes)) return m.hash;
     uint32_t meanwhile = 0;
     {
         std::shared_lock l(g_mtx);
         auto it = g_cache.find(vb_va);
-        const bool further = ib_off == 0 && it != g_cache.end() && it->second.hash && ib_bytes > it->second.ib_bytes;
+        const bool further =
+            it != g_cache.end() && it->second.ib_va == ib_va && it->second.hash && ib_bytes > it->second.ib_bytes;
         if (it != g_cache.end() && !further) {
-            m = LookupMemo{ vb_va, it->second.hash, it->second.ib_bytes, gen };
+            m = LookupMemo{ vb_va, it->second.hash, it->second.ib_bytes, it->second.ib_va, gen };
             return it->second.hash;
         }
         meanwhile = further ? it->second.hash : 0;
-        if ((g_inflight && g_inflight_job.vb_va == vb_va) || g_small_queued.count(vb_va)) return meanwhile;
+        auto qit = g_small_queued.find(vb_va);
+        if ((g_inflight && g_inflight_job.vb_va == vb_va) || (qit != g_small_queued.end() && ib_bytes <= qit->second))
+            return meanwhile;
     }
     D3D12_HEAP_PROPERTIES hp = {};
     D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
     const bool cpu_written = SUCCEEDED(vb_res->GetHeapProperties(&hp, &hf)) && hp.Type != D3D12_HEAP_TYPE_DEFAULT;
     std::unique_lock l(g_mtx);
     auto it = g_cache.find(vb_va);
-    const bool further = ib_off == 0 && it != g_cache.end() && it->second.hash && ib_bytes > it->second.ib_bytes;
+    const bool further =
+        it != g_cache.end() && it->second.ib_va == ib_va && it->second.hash && ib_bytes > it->second.ib_bytes;
     if (it != g_cache.end() && !further) return it->second.hash;
     meanwhile = further ? it->second.hash : 0;
     if (g_inflight && g_inflight_job.vb_va == vb_va) return meanwhile;
-    if (g_small_queued.count(vb_va)) {
-        if (further) {
+    if (auto qit = g_small_queued.find(vb_va); qit != g_small_queued.end()) {
+        if (ib_bytes > qit->second) {
             for (Job& j : g_small_pending)
-                if (j.vb_va == vb_va && j.ib_off == 0 && ib_bytes > j.ib_bytes) {
+                if (j.vb_va == vb_va && j.ib_va == ib_va && ib_bytes > j.ib_bytes) {
                     j.ib_bytes = ib_bytes;
+                    qit->second = ib_bytes;
                     break;
                 }
         }
         return meanwhile;
     }
     if (cpu_written) {
-        StoreLocked(vb_va, Cached{ 0, ib_bytes });
+        StoreLocked(vb_va, Cached{ 0, ib_bytes, ib_va });
         return 0;
     }
     for (const Job& j : g_pending)
@@ -354,7 +362,7 @@ uint32_t LookupSmall(ID3D12Resource* ib_res, uint32_t ib_off, uint32_t ib_bytes,
     ib_res->AddRef();
     vb_res->AddRef();
     g_small_pending.push_back({ ib_res, vb_res, ib_off, ib_bytes, idx_size, vb_off, vb_stride, ib_va, vb_va });
-    g_small_queued.insert(vb_va);
+    g_small_queued[vb_va] = ib_bytes;
     return meanwhile;
 }
 
@@ -456,7 +464,7 @@ void DrainQueue()
             std::unique_lock l(g_mtx);
             if (vbBytes && !g_inflight_stale) {
                 StoreLocked(g_inflight_job.vb_va,
-                    Cached{ full, g_inflight_job.ib_bytes }); // 0 bytes: not run, the next draw requeues
+                    Cached{ full, g_inflight_job.ib_bytes, g_inflight_job.ib_va }); // 0 bytes: not run, the next draw requeues
             }
             done = g_inflight_job;
             g_inflight = false;
@@ -502,7 +510,7 @@ bool Record(ID3D12GraphicsCommandList* cl)
     if (!ValidAlignment(ib_va, vb_va, j.idx_size) || ib_read_end > ibW || j.vb_off >= vbW) { // bad range -> cache 0, skip
         {
             std::unique_lock l(g_mtx);
-            StoreLocked(j.vb_va, Cached{ 0, j.ib_bytes });
+            StoreLocked(j.vb_va, Cached{ 0, j.ib_bytes, j.ib_va });
             g_small_queued.erase(j.vb_va);
         }
         j.ib->Release();
@@ -516,7 +524,7 @@ bool Record(ID3D12GraphicsCommandList* cl)
                 (unsigned long long)j.vb_va, j.ib_bytes, j.idx_size, j.vb_stride, (unsigned long long)(vbW - j.vb_off));
         {
             std::unique_lock l(g_mtx);
-            StoreLocked(j.vb_va, Cached{ 0, j.ib_bytes });
+            StoreLocked(j.vb_va, Cached{ 0, j.ib_bytes, j.ib_va });
             g_small_queued.erase(j.vb_va);
         }
         j.ib->Release();

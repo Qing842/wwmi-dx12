@@ -11,6 +11,8 @@
 #include "../rabbitfx/pso_variant.h"
 #include "../textures/mod_texture_store.h"
 #include "../textures/tex_identity.h"
+#include "../textures/tex_lod.h"
+#include "../textures/tex_rules.h"
 #include "../textures/tex_select.h"
 #include "../textures/tex_slot_log.h"
 #include "../addon/addon.h"
@@ -183,9 +185,14 @@ void InheritGameTexture(void* user, char stage, unsigned slot)
         return;
     }
     const uint32_t resident = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(ri.res));
-    const uint32_t lod =
-        !resident || PortApi::TextureHashHasSections(resident) ? resident : g_tex_select.LodTargetOf(resident);
-    const uint32_t hash = lod && PortApi::TextureHashHasSections(lod) ? lod : resident;
+    uint32_t cand = resident;
+    if (resident && !PortApi::TextureHashHasSections(resident)) {
+        if (const uint32_t exact = g_tex_lod.Known(resident); exact && PortApi::TextureHashHasSections(exact))
+            cand = exact;
+        else if (const uint32_t lod = g_tex_select.LodTargetOf(resident); lod && g_tex_rules.Now().targets.count(lod))
+            cand = lod;
+    }
+    const uint32_t hash = cand && PortApi::TextureHashHasSections(cand) ? cand : resident;
     const unsigned fmt = ri.view_handle
         ? (unsigned)cmd_list->get_device()->get_resource_view_desc(reshade::api::resource_view{ ri.view_handle }).format
         : 0u;

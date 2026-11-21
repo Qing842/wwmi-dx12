@@ -1152,6 +1152,36 @@ ID3D12Resource* SelectTextureOverride(uint32_t texture_hash, bool* cacheable)
     return wr ? wr->dx12 : nullptr;
 }
 
+int DispatchAuxTextureOverride(
+    uint32_t texture_hash, DrawInfo* draw, bool (*ns_allowed)(const std::wstring& ns, void* user), void* user)
+{
+    if (!TextureOverrideHashKnown(texture_hash)) return 0;
+    std::lock_guard<std::recursive_mutex> engine_lk(EngineLock());
+    if (!g_loaded) return 0;
+
+    DrawCallInfo ci = ToCallInfo(draw);
+    TextureOverrideMatches matches;
+    FindTextureOverridesByHash(texture_hash, &matches, &ci);
+    int ran = 0;
+    for (TextureOverride* to : matches) {
+        if (SelectsResource(to) || ModSwitchedOff(to)) continue;
+        if (ns_allowed) {
+            const std::wstring& sec = to->ini_section;
+            const size_t a = sec.find(L'\\');
+            const size_t b = sec.rfind(L'\\');
+            const std::wstring ns =
+                (a != std::wstring::npos && b != std::wstring::npos && b > a) ? sec.substr(a + 1, b - a - 1)
+                                                                              : std::wstring();
+            if (!ns.empty() && !ns_allowed(ns, user)) continue;
+        }
+        RunList(&to->command_list, &ci, false);
+        QueuePost(&to->post_command_list, ci);
+        ++ran;
+    }
+    if (draw && ci.skip) draw->skip = true;
+    return ran;
+}
+
 static bool SectionInNs(const std::wstring& sec, const wchar_t* ns, size_t nlen)
 {
     static const wchar_t kPrefix[] = L"TextureOverride\\";

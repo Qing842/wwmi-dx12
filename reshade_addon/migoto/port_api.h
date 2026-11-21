@@ -118,6 +118,8 @@ bool ShaderRegexLinked(uint64_t ini_hash);
 bool ShaderRegexGroupLoaded(const wchar_t* ns, const wchar_t* group);
 
 int DispatchTextureOverride(uint32_t texture_hash, DrawInfo* draw);
+int DispatchAuxTextureOverride(
+    uint32_t texture_hash, DrawInfo* draw, bool (*ns_allowed)(const std::wstring& ns, void* user), void* user);
 
 bool RunSectionByName(const wchar_t* fq_section, DrawInfo* draw);
 bool RunSectionThenPost(const wchar_t* fq_section, DrawInfo* draw);

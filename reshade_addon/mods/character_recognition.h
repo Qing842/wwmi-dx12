@@ -53,9 +53,19 @@ public:
     // INDEX-BUFFER ANCHOR: an index buffer carrying a mod's complete declared component set is that mod's.
     bool IbAnchorNoteAndAsk(uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx,
         bool content_proven); // ib_bytes: the IB's extent
+    void NotePassiveSharedEvidence(uint64_t ib_va, const std::vector<int>& cands);
+    int PickCandidateByIbEvidence(uint64_t ib_va, const std::vector<int>& cands);
     void IbAnchorForget(uint64_t va, uint64_t bytes);
     bool IbAnchorResolve(uint64_t index_va, uint32_t index_bytes, int* mod_id, uint64_t* ib_base_va);
     bool IbAnchorJustLearned(uint64_t index_va); // this is the first frame its draws are claimed
+
+    // Per-mod identity disambiguation (shapekey stream 6 & namespace-owned textures).
+    bool ModNeedsProof(int mod_id);
+    bool ModDeclaresShapekeyHash(int mod_id, uint32_t u0_hash);
+    uint32_t BoundShapekeyU0Hash(reshade::api::command_list* cmd_list);
+    bool DrawMatchesModShapekey(reshade::api::command_list* cmd_list, int mod_id);
+    int PickCandidateByBoundTextures(reshade::api::command_list* cmd_list, const std::vector<int>& cands);
+    bool DrawBindsOwnModTexture(reshade::api::command_list* cmd_list, int mod_id);
 
     // Texture-identity ownership: the draw binds a texture a mod's rules target.
     bool DrawBindsModTexture(reshade::api::command_list* cmd_list);
@@ -117,16 +127,21 @@ private:
         bool covers(const CompSet& d) const;
         unsigned count() const;
     };
-    struct IbEvidence {
-        uint32_t frame = 0;
+    struct IbEvidenceEntry {
         uint64_t ns_hash = 0;
         CompSet seen;
+        bool proven = false;
+    };
+    struct IbEvidence {
+        uint32_t frame = 0;
+        std::vector<IbEvidenceEntry> entries;
     };
     struct IbAnchorRec {
         uint64_t ns_hash = 0;
         uint32_t learned = 0;
         uint32_t confirmed = 0;
         uint64_t bytes = 0;
+        bool proven = false;
     };
     static constexpr size_t kIbAnchorCap = 256; // a character is one entry; a sweep past this is a leak guard
     static constexpr uint32_t kIbAnchorStale = 1800; // ~30 s unconfirmed -- the buffer is not on screen any more

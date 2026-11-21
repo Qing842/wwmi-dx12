@@ -101,11 +101,27 @@ bool RunDrawShaderOverrides(const DrawArgs& da)
     return false;
 }
 
-static int PickSharedRangeSlot(command_list* cmd_list, uint32_t first_index, uint32_t index_count, int dflt)
+static int PickSharedRangeSlot(
+    command_list* cmd_list, uint32_t first_index, uint32_t index_count, int dflt, bool* out_proven)
 {
+    if (out_proven) *out_proven = false;
     const std::vector<int>* sh = Comps().SharedSlots(first_index, index_count);
-    if (!sh) return dflt;
+    if (!sh || sh->empty()) return dflt;
     const std::vector<int>& cands = *sh;
+    uint32_t common_ib = 0;
+    bool same_ib = true;
+    for (size_t i = 0; i < cands.size(); ++i) {
+        const MergedComp& mc = Comps().At((size_t)cands[i]);
+        const WwmiMod::Component* wc = Mods().Comp(mc.mod_id, mc.comp_idx);
+        const uint32_t h = wc ? wc->ib_hash : 0u;
+        if (!h || (i > 0 && h != common_ib)) {
+            same_ib = false;
+            break;
+        }
+        common_ib = h;
+    }
+    if (same_ib) return dflt;
+
     ID3D12Resource* ibr = nullptr;
     ID3D12Resource* vbr = nullptr;
     uint64_t ibva = 0;
@@ -121,27 +137,65 @@ static int PickSharedRangeSlot(command_list* cmd_list, uint32_t first_index, uin
         vbva = st.vb[0].va;
         vstride = st.vb[0].stride;
     }
-    CharVbOrigin origin;
-    if (vbva && g_recognition.CharMeshOrigin(vbva, &origin) && origin.ns_hash)
-        for (int s : cands)
-            if (Mods().At(Comps().At(s).mod_id).ns_hash == origin.ns_hash) return s;
-    if (!ibr || !vbr || !vstride) return dflt;
-    const uint32_t iboff = (uint32_t)(ibva - ibr->GetGPUVirtualAddress());
-    const uint32_t vboff = (uint32_t)(vbva - vbr->GetGPUVirtualAddress());
-    for (int s : cands) {
-        const int md = Comps().At(s).mod_id;
-        const WwmiMod::Component* wc = Mods().Comp(md, Comps().At(s).comp_idx);
-        if (!wc || !wc->ib_hash) continue;
-        const uint32_t max_end = Mods().IndexEnd(md, wc->ib_hash);
-        if (max_end && IbHash::Lookup(ibr, iboff, max_end * idxb, idxb, vbr, vboff, vstride) == wc->ib_hash) {
-            if (g_debug && DiagChanged("SHAREDRANGE", (int)(first_index ^ index_count), (unsigned long long)s))
-                logger::write(
-                    "SHAREDRANGE first=%u count=%u: %zu mods declare this range; the index buffer names mod %d comp %d",
-                    first_index, index_count, cands.size(), md, Comps().At(s).comp_idx);
-            return s;
+    if (const uint32_t u0_hash = g_recognition.BoundShapekeyU0Hash(cmd_list)) {
+        int sk_slot = -1;
+        uint32_t sk_ib = 0;
+        bool sk_conflict = false;
+        for (int s : cands) {
+            const MergedComp& mc = Comps().At((size_t)s);
+            if (!g_recognition.ModDeclaresShapekeyHash(mc.mod_id, u0_hash)) continue;
+            const WwmiMod::Component* wc = Mods().Comp(mc.mod_id, mc.comp_idx);
+            const uint32_t h = wc ? wc->ib_hash : 0u;
+            if (sk_slot < 0) {
+                sk_slot = s;
+                sk_ib = h;
+            } else if (h != sk_ib || !h) {
+                sk_conflict = true;
+                break;
+            }
+        }
+        if (sk_slot >= 0 && !sk_conflict) {
+            if (out_proven) *out_proven = true;
+            return sk_slot;
         }
     }
-    return dflt;
+    if (ibr && vbr && vstride) {
+        const uint32_t iboff = (uint32_t)(ibva - ibr->GetGPUVirtualAddress());
+        const uint32_t vboff = (uint32_t)(vbva - vbr->GetGPUVirtualAddress());
+        for (int s : cands) {
+            const int md = Comps().At(s).mod_id;
+            const WwmiMod::Component* wc = Mods().Comp(md, Comps().At(s).comp_idx);
+            if (!wc || !wc->ib_hash) continue;
+            const uint32_t max_end = Mods().IndexEnd(md, wc->ib_hash);
+            if (max_end && IbHash::Lookup(ibr, iboff, max_end * idxb, idxb, vbr, vboff, vstride) == wc->ib_hash) {
+                if (out_proven) *out_proven = true;
+                if (g_debug && DiagChanged("SHAREDRANGE", (int)(first_index ^ index_count), (unsigned long long)s))
+                    logger::write(
+                        "SHAREDRANGE first=%u count=%u: %zu mods declare this range; the index buffer names mod %d comp %d",
+                        first_index, index_count, cands.size(), md, Comps().At(s).comp_idx);
+                return s;
+            }
+        }
+    }
+    if (const int ts = g_recognition.PickCandidateByBoundTextures(cmd_list, cands); ts >= 0) {
+        if (out_proven) *out_proven = true;
+        return ts;
+    }
+    int anchored_mod = -1;
+    uint64_t anchored_base = 0;
+    if (ibva && g_recognition.IbAnchorResolve(ibva, idxb, &anchored_mod, &anchored_base) && anchored_mod >= 0) {
+        for (int s : cands)
+            if (Comps().At((size_t)s).mod_id == anchored_mod) return s;
+    }
+    CharVbOrigin origin;
+    if (vbva && g_recognition.CharMeshOrigin(vbva, &origin) && origin.ns_hash && g_frame_id - origin.frame <= 4u) {
+        for (int s : cands)
+            if (Mods().At(Comps().At(s).mod_id).ns_hash == origin.ns_hash) return s;
+    }
+    if (const int es = g_recognition.PickCandidateByIbEvidence(ibva, cands); es >= 0) return es;
+
+    g_recognition.NotePassiveSharedEvidence(ibva, cands);
+    return -1;
 }
 
 #ifdef WWMI_DEBUG
@@ -256,8 +310,11 @@ uint32_t LookupSmallFromDraw(const DrawArgs& da, uint32_t* out_vstride = nullptr
 #endif
         return 0;
     }
-    const uint32_t ib_off = (uint32_t)(ibva - ibr->GetGPUVirtualAddress()) + da.first_index * idxb;
-    const uint32_t got = IbHash::LookupSmall(ibr, ib_off, da.index_count * idxb, idxb, vbr, (uint32_t)vb_off, vstride);
+    const uint32_t base_ib_off = (uint32_t)(ibva - ibr->GetGPUVirtualAddress());
+    const uint32_t ib_off = da.vertex_offset == 0 ? base_ib_off : base_ib_off + da.first_index * idxb;
+    const uint32_t ib_bytes =
+        da.vertex_offset == 0 ? (da.first_index + da.index_count) * idxb : da.index_count * idxb;
+    const uint32_t got = IbHash::LookupSmall(ibr, ib_off, ib_bytes, idxb, vbr, (uint32_t)vb_off, vstride);
 #ifdef WWMI_DEBUG
     SmallMeshSeen(da, vbr, vbva, vstride, vsize, got ? "hash" : "pending or not hashed", got);
 #else
@@ -314,7 +371,8 @@ bool DispatchDrawnMeshOverrides(
 bool RunSmallMeshOverrides(const DrawArgs& da)
 {
     const bool menu_shape = g_settings.decensor && da.index_count == kMenuBackdropIndices;
-    if (da.index_count < 24 || da.index_count >= 256 ||
+    const uint32_t min_idx = da.draw_rt.has_dsv ? 18u : 24u;
+    if (da.index_count < min_idx || da.index_count >= 256 ||
         (!menu_shape && !g_recognition.SmallMeshAny() && !g_recognition.ModelHashAny()))
         return false;
     uint32_t vstride = 0;
@@ -340,8 +398,9 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
     const uint64_t vs_hash = da.vs_hash;
     const CmdRT& draw_rt = da.draw_rt;
     if (Comps().Loaded() && g_draw_toggles.merged_bone_cb) {
+        bool shared_proven = false;
         int mc_slot = Comps().SlotOf(first_index, index_count);
-        if (mc_slot >= 0) mc_slot = PickSharedRangeSlot(cmd_list, first_index, index_count, mc_slot);
+        if (mc_slot >= 0) mc_slot = PickSharedRangeSlot(cmd_list, first_index, index_count, mc_slot, &shared_proven);
         const bool skip_any = g_recognition.SkipVbHashAny();
         const bool model_any = g_recognition.ModelHashAny();
         const bool small_any = g_recognition.SmallMeshAny();
@@ -452,7 +511,7 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                         }
                     }
                 }
-            } else if (!skinned && first_index == 0 && da.instance_count == 1 &&
+            } else if (!skinned && da.instance_count <= 2 &&
                 (skip_any || (draw_rt.rtv_count > 0 && (model_any || small_any)))) {
                 uint32_t vstride = 0;
                 const uint32_t got = LookupSmallFromDraw(da, &vstride);
@@ -563,6 +622,11 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
             bool char_tex = false;
             if (!char_vb && !char_ib && !has_ib_ref) char_tex = g_recognition.DrawBindsModTexture(cmd_list);
             bool is_mod_char = char_ib || char_tex; // a definitive identification this draw
+            bool content_proven = is_mod_char || shared_proven;
+            if (!content_proven && !char_vb) {
+                content_proven = g_recognition.DrawMatchesModShapekey(cmd_list, md) ||
+                    (g_recognition.ModNeedsProof(md) && g_recognition.DrawBindsOwnModTexture(cmd_list, md));
+            }
             bool char_ibset = false;
             if (g_draw_toggles.ib_anchor_claim) {
                 uint64_t claim_ib_va = 0;
@@ -572,7 +636,7 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                     claim_ib_va = gs.ib.va;
                     claim_ib_bytes = gs.ib.size;
                 }
-                char_ibset = g_recognition.IbAnchorNoteAndAsk(claim_ib_va, claim_ib_bytes, md, ci, is_mod_char);
+                char_ibset = g_recognition.IbAnchorNoteAndAsk(claim_ib_va, claim_ib_bytes, md, ci, content_proven);
                 if (char_ibset && !is_mod_char && !char_vb)
                     g_draw_stats.ib_anchor_claims.fetch_add(1, std::memory_order_relaxed);
             }

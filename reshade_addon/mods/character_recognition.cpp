@@ -1,6 +1,7 @@
 // character_recognition.cpp -- see character_recognition.h.
 #include "../addon_common.h"
 #include "character_recognition.h"
+#include "buffer_relocation.h"
 #include "component_table.h"
 #include "game_cb_reader.h"
 #include "layout_registry.h"
@@ -8,11 +9,13 @@
 #include "../draw/draw_toggles.h"
 #include "../instrumentation/diag_gate.h"
 #include "../hooks/command_list_registry.h"
+#include "../hooks/pipeline_registry.h"
 #include "../instrumentation/profiler.h"
 #include "../textures/tex_rules.h"
 #include "../textures/tex_select.h"
 #include "../textures/tex_lod.h"
 #include "mod_set.h"
+#include <cwctype>
 
 CharacterRecognition g_recognition;
 
@@ -129,10 +132,68 @@ unsigned CharacterRecognition::CompSet::count() const
 
 struct CharacterRecognition::PerSet : SetState {
     std::unordered_map<int, CompSet> declared;
+    std::vector<uint8_t> shape_ambiguous;
+    std::vector<std::vector<unsigned>> sk_cbs;
     void Build(ModSet& set) override
     {
-        for (const MergedComp& c : set.comps.All())
-            if (c.comp_idx >= 0) declared[c.mod_id].set(c.comp_idx);
+        auto is_numbered_comp = [](const WwmiMod::Component* wc) {
+            if (!wc || wc->tail.size() <= 9 || _wcsnicmp(wc->tail.c_str(), L"Component", 9) != 0) return false;
+            for (size_t i = 9; i < wc->tail.size(); ++i)
+                if (!iswdigit(wc->tail[i])) return false;
+            return true;
+        };
+        const size_t n_mods = set.mods.Count();
+        std::vector<uint8_t> has_numbered_comp(n_mods, 0);
+        for (const MergedComp& c : set.comps.All()) {
+            if (c.comp_idx < 0 || c.mod_id < 0 || (size_t)c.mod_id >= n_mods) continue;
+            if (is_numbered_comp(set.mods.Comp(c.mod_id, c.comp_idx))) has_numbered_comp[(size_t)c.mod_id] = 1;
+        }
+        for (const MergedComp& c : set.comps.All()) {
+            if (c.comp_idx < 0 || c.mod_id < 0 || (size_t)c.mod_id >= n_mods) continue;
+            if (has_numbered_comp[(size_t)c.mod_id] && !is_numbered_comp(set.mods.Comp(c.mod_id, c.comp_idx))) continue;
+            declared[c.mod_id].set(c.comp_idx);
+        }
+        shape_ambiguous.assign(n_mods, 0);
+        for (size_t m = 0; m < n_mods; ++m) {
+            auto dit = declared.find((int)m);
+            if (dit == declared.end() || dit->second.count() < 2) {
+                shape_ambiguous[m] = 1;
+                continue;
+            }
+            bool any_unique_range = false;
+            for (const MergedComp& c : set.comps.All()) {
+                if (c.mod_id != (int)m || c.comp_idx < 0) continue;
+                CompSet single;
+                single.set(c.comp_idx);
+                if (!dit->second.covers(single)) continue;
+                const WwmiMod::Component* wc = set.mods.Comp(c.mod_id, c.comp_idx);
+                const uint32_t own_ib = wc ? wc->ib_hash : 0u;
+                const std::vector<int>* sh = set.comps.SharedSlots(c.first_index, c.match_count);
+                bool diff_ib = false;
+                if (sh) {
+                    for (int s : *sh) {
+                        const MergedComp& oc = set.comps.At((size_t)s);
+                        const WwmiMod::Component* owc = set.mods.Comp(oc.mod_id, oc.comp_idx);
+                        const uint32_t other_ib = owc ? owc->ib_hash : 0u;
+                        if (other_ib != own_ib || !own_ib) {
+                            diff_ib = true;
+                            break;
+                        }
+                    }
+                }
+                if (!diff_ib) {
+                    any_unique_range = true;
+                    break;
+                }
+            }
+            if (!any_unique_range) shape_ambiguous[m] = 1;
+        }
+        sk_cbs.resize(n_mods);
+        for (size_t m = 0; m < n_mods; ++m) {
+            const auto sets = PortApi::ModDeclaredShapeKeySets(set.mods.At(m).wcl_ns.c_str());
+            for (const PortApi::ShapeKeySet& s : sets)
+                if (s.cb) sk_cbs[m].push_back(s.cb);
+        }
     }
 };
 
@@ -143,42 +204,162 @@ CharacterRecognition::CompSet CharacterRecognition::ModDeclaredComps(int mod_id)
     return it == declared.end() ? CompSet{} : it->second;
 }
 
+bool CharacterRecognition::ModNeedsProof(int mod_id)
+{
+    const auto& amb = CurrentSet().State<PerSet>().shape_ambiguous;
+    return mod_id < 0 || (size_t)mod_id >= amb.size() || amb[(size_t)mod_id] != 0;
+}
+
+bool CharacterRecognition::ModDeclaresShapekeyHash(int mod_id, uint32_t u0_hash)
+{
+    if (!u0_hash || mod_id < 0) return false;
+    const auto& cbs = CurrentSet().State<PerSet>().sk_cbs;
+    if ((size_t)mod_id >= cbs.size()) return false;
+    for (unsigned h : cbs[(size_t)mod_id])
+        if (h == u0_hash) return true;
+    return false;
+}
+
+uint32_t CharacterRecognition::BoundShapekeyU0Hash(command_list* cmd_list)
+{
+    const auto& st = g_command_lists.Gfx(cmd_list);
+    if (!st.gfx_pso || !g_pipelines.ReadsStream6(st.gfx_pso)) return 0;
+    if (!st.vb[6].res || !st.vb[6].res_width || st.vb[6].res_width > 0xFFFFFFFFull) return 0;
+    const unsigned orig = g_buffer_reloc.IdentityBytes(st.vb[6].res, (unsigned)st.vb[6].res_width);
+    return orig ? PortApi::GameComputeUavBufferHash(orig) : 0u;
+}
+
+bool CharacterRecognition::DrawMatchesModShapekey(command_list* cmd_list, int mod_id)
+{
+    const uint32_t u0 = BoundShapekeyU0Hash(cmd_list);
+    return u0 && ModDeclaresShapekeyHash(mod_id, u0);
+}
+
+void CharacterRecognition::NotePassiveSharedEvidence(uint64_t ib_va, const std::vector<int>& cands)
+{
+    if (!ib_va || cands.empty()) return;
+    std::lock_guard l(ib_anchor_mutex_);
+    IbEvidence& e = ib_ev_[ib_va];
+    if (e.frame != g_frame_id) {
+        e.frame = g_frame_id;
+        e.entries.clear();
+    }
+    for (int s : cands) {
+        const MergedComp& mc = Comps().At((size_t)s);
+        if (mc.mod_id < 0 || mc.comp_idx < 0 || (size_t)mc.mod_id >= Mods().Count()) continue;
+        const uint64_t ns_hash = Mods().At((size_t)mc.mod_id).ns_hash;
+        if (!ns_hash) continue;
+        IbEvidenceEntry* ent = nullptr;
+        for (IbEvidenceEntry& it : e.entries)
+            if (it.ns_hash == ns_hash) {
+                ent = &it;
+                break;
+            }
+        if (!ent) {
+            if (e.entries.size() >= 8) continue;
+            e.entries.push_back(IbEvidenceEntry{ ns_hash, {}, false });
+            ent = &e.entries.back();
+        }
+        ent->seen.set(mc.comp_idx);
+    }
+}
+
+int CharacterRecognition::PickCandidateByIbEvidence(uint64_t ib_va, const std::vector<int>& cands)
+{
+    if (!ib_va || cands.empty()) return -1;
+    std::lock_guard l(ib_anchor_mutex_);
+    auto it = ib_ev_.find(ib_va);
+    if (it == ib_ev_.end() || it->second.frame != g_frame_id || it->second.entries.empty()) return -1;
+    const auto& entries = it->second.entries;
+    int best_s = -1;
+    uint32_t best_ib = 0;
+    bool best_proven = false;
+    unsigned best_cnt = 0;
+    bool tied_diff_ib = false;
+    for (int s : cands) {
+        const MergedComp& mc = Comps().At((size_t)s);
+        if (mc.mod_id < 0 || (size_t)mc.mod_id >= Mods().Count()) continue;
+        const uint64_t ns_hash = Mods().At((size_t)mc.mod_id).ns_hash;
+        const WwmiMod::Component* wc = Mods().Comp(mc.mod_id, mc.comp_idx);
+        const uint32_t cand_ib = wc ? wc->ib_hash : 0u;
+        const IbEvidenceEntry* ent = nullptr;
+        for (const IbEvidenceEntry& e : entries)
+            if (e.ns_hash == ns_hash) {
+                ent = &e;
+                break;
+            }
+        if (!ent) continue;
+        const unsigned cnt = ent->seen.count();
+        if (!cnt && !ent->proven) continue;
+        if (best_s < 0 || (ent->proven && !best_proven) || (ent->proven == best_proven && cnt > best_cnt)) {
+            best_s = s;
+            best_ib = cand_ib;
+            best_proven = ent->proven;
+            best_cnt = cnt;
+            tied_diff_ib = false;
+        } else if (ent->proven == best_proven && cnt == best_cnt && (cand_ib != best_ib || !cand_ib)) {
+            tied_diff_ib = true;
+        }
+    }
+    return tied_diff_ib ? -1 : best_s;
+}
+
 bool CharacterRecognition::IbAnchorNoteAndAsk(
     uint64_t ib_va, uint64_t ib_bytes, int mod_id, int comp_idx, bool content_proven)
 {
     if (!ib_va || mod_id < 0 || comp_idx < 0 || mod_id >= (int)Mods().Count()) return false;
     const CompSet declared = ModDeclaredComps(mod_id);
     if (declared.empty()) return false;
+    const bool need_proof = ModNeedsProof(mod_id);
     const uint64_t ns_hash = Mods().At(mod_id).ns_hash;
     if (!ns_hash) return false;
     std::lock_guard l(ib_anchor_mutex_);
     IbEvidence& e = ib_ev_[ib_va];
-    if (e.frame != g_frame_id || e.ns_hash != ns_hash) {
+    if (e.frame != g_frame_id) {
         e.frame = g_frame_id;
-        e.ns_hash = ns_hash;
-        e.seen = CompSet{};
+        e.entries.clear();
     }
-    e.seen.set(comp_idx);
-    const bool shape_only = declared.count() < 2 && !content_proven;
+    IbEvidenceEntry* ent = nullptr;
+    for (IbEvidenceEntry& it : e.entries)
+        if (it.ns_hash == ns_hash) {
+            ent = &it;
+            break;
+        }
+    if (!ent) {
+        if (e.entries.size() >= 8) e.entries.erase(e.entries.begin());
+        e.entries.push_back(IbEvidenceEntry{ ns_hash, {}, false });
+        ent = &e.entries.back();
+    }
+    ent->seen.set(comp_idx);
+    if (content_proven) ent->proven = true;
+    const bool shape_only = need_proof && !ent->proven;
 #ifdef WWMI_DEBUG
-    if (shape_only && e.seen.covers(declared) && DiagOnce("IBANCHOR-SHAPE", (int)(uint32_t)(ns_hash ^ (ns_hash >> 32))))
-        logger::write("IBANCHOR-SHAPE mod %d: index buffer %llx holds a draw the shape of its only component, but "
-                      "nothing in it proves it is the mod's mesh -- not anchored",
+    if (shape_only && ent->seen.covers(declared) &&
+        DiagOnce("IBANCHOR-SHAPE", (int)(uint32_t)(ns_hash ^ (ns_hash >> 32))))
+        logger::write("IBANCHOR-SHAPE mod %d: index buffer %llx holds draws matching its component shape, but "
+                      "nothing in it proves it is this mod's mesh -- not anchored",
             mod_id, (unsigned long long)ib_va);
 #endif
-    if (!shape_only && e.seen.covers(declared)) {
-        IbAnchorRec& a = ib_anchor_[ib_va];
-        a.bytes = ib_bytes;
-        if (a.ns_hash != ns_hash) {
-            a.ns_hash = ns_hash;
-            a.learned = g_frame_id;
-            g_draw_stats.ib_anchor_learned.fetch_add(1, std::memory_order_relaxed);
-            logger::write("IBANCHOR learned: index buffer %llx carries mod %d's COMPLETE declared component "
-                          "set (%u components) in frame %u -- its draws are claimed from the next frame on, "
-                          "with no vertex content consulted",
-                (unsigned long long)ib_va, mod_id, declared.count(), g_frame_id);
+    if (!shape_only && ent->seen.covers(declared)) {
+        auto cur = ib_anchor_.find(ib_va);
+        const bool blocked_by_proven = cur != ib_anchor_.end() && cur->second.ns_hash != ns_hash &&
+            cur->second.proven && !ent->proven && g_frame_id - cur->second.confirmed <= 4u;
+        if (!blocked_by_proven) {
+            IbAnchorRec& a = ib_anchor_[ib_va];
+            a.bytes = ib_bytes;
+            if (a.ns_hash != ns_hash) {
+                a.ns_hash = ns_hash;
+                a.learned = g_frame_id;
+                a.proven = ent->proven;
+                g_draw_stats.ib_anchor_learned.fetch_add(1, std::memory_order_relaxed);
+                logger::write("IBANCHOR learned: index buffer %llx carries mod %d's COMPLETE declared component "
+                              "set (%u components, proven=%d) in frame %u -- its draws are claimed from the next frame on",
+                    (unsigned long long)ib_va, mod_id, declared.count(), (int)ent->proven, g_frame_id);
+            } else if (ent->proven) {
+                a.proven = true;
+            }
+            a.confirmed = g_frame_id;
         }
-        a.confirmed = g_frame_id;
     }
     if (ib_anchor_.size() > kIbAnchorCap)
         for (auto it = ib_anchor_.begin(); it != ib_anchor_.end();)
@@ -267,6 +448,59 @@ bool CharacterRecognition::DrawBindsModTexture(command_list* cmd_list)
     int n = 0;
     CollectBoundModTexHashes(cmd_list, hs, 8, n);
     return n > 0;
+}
+
+bool CharacterRecognition::DrawBindsOwnModTexture(command_list* cmd_list, int mod_id)
+{
+    if (mod_id < 0 || (size_t)mod_id >= Mods().Count()) return false;
+    const wchar_t* ns = Mods().At((size_t)mod_id).wcl_ns.c_str();
+    if (!ns || !*ns) return false;
+    uint32_t hs[16];
+    int n = 0;
+    CollectBoundModTexHashes(cmd_list, hs, 16, n);
+    for (int i = 0; i < n; ++i)
+        if (PortApi::TextureOverrideInNs(hs[i], ns)) return true;
+    return false;
+}
+
+int CharacterRecognition::PickCandidateByBoundTextures(command_list* cmd_list, const std::vector<int>& cands)
+{
+    if (cands.empty()) return -1;
+    uint32_t hs[16];
+    int n = 0;
+    CollectBoundModTexHashes(cmd_list, hs, 16, n);
+    if (!n) return -1;
+    int chosen_s = -1;
+    uint32_t chosen_ib = 0;
+    for (int i = 0; i < n; ++i) {
+        const uint32_t h = hs[i];
+        int match_s = -1;
+        uint32_t match_ib = 0;
+        bool multi_ib = false;
+        for (int s : cands) {
+            const MergedComp& mc = Comps().At((size_t)s);
+            if (mc.mod_id < 0 || (size_t)mc.mod_id >= Mods().Count()) continue;
+            const wchar_t* ns = Mods().At((size_t)mc.mod_id).wcl_ns.c_str();
+            if (!ns || !*ns || !PortApi::TextureOverrideInNs(h, ns)) continue;
+            const WwmiMod::Component* wc = Mods().Comp(mc.mod_id, mc.comp_idx);
+            const uint32_t cand_ib = wc ? wc->ib_hash : 0u;
+            if (match_s < 0) {
+                match_s = s;
+                match_ib = cand_ib;
+            } else if (cand_ib != match_ib || !cand_ib) {
+                multi_ib = true;
+                break;
+            }
+        }
+        if (match_s < 0 || multi_ib) continue; // shared texture across candidates, or matched none
+        if (chosen_s < 0) {
+            chosen_s = match_s;
+            chosen_ib = match_ib;
+        } else if (match_ib != chosen_ib || !chosen_ib) {
+            return -1; // conflicting exclusive textures on the same draw
+        }
+    }
+    return chosen_s;
 }
 
 bool CharacterRecognition::IbHashEverClaimed(uint32_t ib_hash)

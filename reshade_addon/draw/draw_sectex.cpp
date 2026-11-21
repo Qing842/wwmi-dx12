@@ -12,6 +12,7 @@
 #include "../instrumentation/diag_arms.h"
 #include "../migoto/port_api.h"
 #include "../textures/tex_identity.h"
+#include "../textures/tex_rules.h"
 #include "../textures/tex_select.h"
 #include "../textures/tex_crawl.h"
 #include "../textures/tex_lod.h"
@@ -27,6 +28,14 @@
 using namespace reshade::api;
 
 SectionTexturePublisher g_section_textures;
+
+static uint32_t ResolveSectionTexHash(uint32_t resident)
+{
+    if (!resident || PortApi::TextureHashHasSections(resident)) return resident;
+    if (const uint32_t exact = g_tex_lod.Known(resident); exact && PortApi::TextureHashHasSections(exact)) return exact;
+    if (const uint32_t lod = g_tex_select.LodTargetOf(resident); lod && g_tex_rules.Now().targets.count(lod)) return lod;
+    return resident;
+}
 
 struct PsTexture {
     unsigned reg = 0;
@@ -146,8 +155,7 @@ uint16_t SectionTexturePublisher::PublishCarried(
         CarriedTexture ct;
         if (listed) {
             const uint32_t resident = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(ri.res));
-            const uint32_t hash =
-                !resident || PortApi::TextureHashHasSections(resident) ? resident : g_tex_select.LodTargetOf(resident);
+            const uint32_t hash = ResolveSectionTexHash(resident);
             ct.res = ri.res;
             ct.hash = hash && PortApi::TextureHashHasSections(hash) ? hash : resident;
             ct.fmt =
@@ -184,6 +192,7 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
     cmd_list->get_private_data(s_iid_ps_hash, &ps_hash);
     const uint64_t pass = TexLookPlaceOf(Mods().At(dm).wcl_ns.c_str(), comp, ps_hash);
     const bool every_slot = Mods().At(dm).mod.queries_ps_slots;
+    const auto& rule_targets = g_tex_rules.Now().targets;
     device* dev = cmd_list->get_device();
     ForEachPsTexture(
         cmd_list, g_debug, ps_regs, [](unsigned) { return true; },
@@ -193,11 +202,12 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
             const TableStart& ts = t.ts;
             const ResInfo& ri = t.ri;
             const uint32_t resident = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(ri.res));
-            if (read && resident)
-                g_tex_look.AtPlace(pass, r, resident,
-                    PortApi::TextureHashHasSections(resident) ? resident : g_tex_lod.Known(resident));
-            const uint32_t hash =
-                !resident || PortApi::TextureHashHasSections(resident) ? resident : g_tex_select.LodTargetOf(resident);
+            if (read && resident) {
+                uint32_t look_tgt = rule_targets.count(resident) ? resident : g_tex_lod.Known(resident);
+                if (look_tgt && !rule_targets.count(look_tgt)) look_tgt = 0;
+                g_tex_look.AtPlace(pass, r, resident, look_tgt);
+            }
+            const uint32_t hash = ResolveSectionTexHash(resident);
             const bool known = hash && PortApi::TextureHashHasSections(hash);
             if (!known && !(every_slot && read)) return;
             if (read) {
@@ -393,17 +403,20 @@ void SectionTexturePublisher::NoteMeshPlaces(const DrawArgs& da)
     const uint32_t mask = crawl ? ~0u : g_tex_look.MeshMask(pass, kSectionTexRegs);
     if (!mask) return;
     const DxilSrvRegs ps_regs = g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p');
+    const auto& rule_targets = g_tex_rules.Now().targets;
     ForEachPsTexture(
         cmd_list, false, ps_regs, [&](unsigned r) { return ((mask >> r) & 1u) != 0; },
         [&](const PsTexture& t) {
             const uint32_t resident = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(t.ri.res));
             if (!resident) return;
             const uint64_t place = TexLookSlotOf(pass, t.reg);
-            if (crawl)
+            if (crawl) {
                 g_tex_crawl.Note(place, resident);
-            else
-                g_tex_look.AtMeshPlace(
-                    place, resident, PortApi::TextureHashHasSections(resident) ? resident : g_tex_lod.Known(resident));
+            } else {
+                uint32_t look_tgt = rule_targets.count(resident) ? resident : g_tex_lod.Known(resident);
+                if (look_tgt && !rule_targets.count(look_tgt)) look_tgt = 0;
+                g_tex_look.AtMeshPlace(place, resident, look_tgt);
+            }
         });
 }
 
@@ -412,21 +425,28 @@ void SectionTexturePublisher::DispatchAuxTextures(const DrawArgs& da)
     command_list* const cmd_list = da.cmd_list;
     const DxilSrvRegs ps_regs = g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p');
     if (ps_regs.parsed && !ps_regs.unbounded && !ps_regs.lo) return;
+    const auto& rules = g_tex_rules.Now().hash_to_rule;
     ForEachPsTexture(
         cmd_list, false, ps_regs, [](unsigned) { return true; },
         [&](const PsTexture& t) {
             const uint32_t resident = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(t.ri.res));
             if (!resident) return;
-            const uint32_t lod =
-                PortApi::TextureHashHasSections(resident) ? resident : g_tex_select.LodTargetOf(resident);
-            const uint32_t hash = lod && PortApi::TextureHashHasSections(lod) ? lod : 0u;
-            if (!hash) return;
-            if (g_recognition.ModelHashAny()) g_recognition.NoteModelDrawn(hash);
+            const uint32_t exact =
+                PortApi::TextureHashHasSections(resident) ? resident : g_tex_lod.Known(resident);
+            const uint32_t hash = exact && PortApi::TextureHashHasSections(exact) ? exact : 0u;
+            if (!hash || rules.count(hash)) return;
             PortApi::DrawInfo di;
             di.first_index = da.first_index;
             di.index_count = da.index_count;
             di.instance_count = da.instance_count;
             di.is_pixel_shader = true;
-            PortApi::DispatchTextureOverride(hash, &di);
+            const int ran = PortApi::DispatchAuxTextureOverride(
+                hash, &di,
+                [](const std::wstring& ns, void*) {
+                    const int md = Mods().IdOfNs(ns);
+                    return md < 0 || Mods().OnScreen(md);
+                },
+                nullptr);
+            if (ran > 0 && g_recognition.ModelHashAny()) g_recognition.NoteModelDrawn(hash);
         });
 }
