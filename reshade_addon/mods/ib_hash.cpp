@@ -249,7 +249,7 @@ uint32_t chain_desc(uint32_t data_crc, uint32_t byteWidth)
 
 bool DeclaredOverrideHash(uint32_t h)
 {
-    return h != 0u && !PortApi::TextureOverrideHashKnown(0u) && PortApi::TextureOverrideHashKnown(h);
+    return h != 0u && !PortApi::TextureHashHasSections(0u) && PortApi::TextureHashHasSections(h);
 }
 
 uint32_t ResolveVbHash(uint32_t data_crc, uint32_t byteWidth, bool* out_matched)
@@ -259,7 +259,7 @@ uint32_t ResolveVbHash(uint32_t data_crc, uint32_t byteWidth, bool* out_matched)
         if (out_matched) *out_matched = true;
         return primary;
     }
-    if (!PortApi::TextureOverrideHashKnown(0u)) {
+    if (!PortApi::TextureHashHasSections(0u)) {
         static constexpr uint32_t kAltDescs[][5] = {
             { 0u, 0x1u, 0u, 0u, 0u },       // DEFAULT, VERTEX_BUFFER
             { 0u, 0x9u, 0u, 0x20u, 0u },    // DEFAULT, VERTEX | SRV, ALLOW_RAW_VIEWS
@@ -273,7 +273,7 @@ uint32_t ResolveVbHash(uint32_t data_crc, uint32_t byteWidth, bool* out_matched)
         for (const auto& a : kAltDescs) {
             const uint32_t desc[6] = { byteWidth, a[0], a[1], a[2], a[3], a[4] };
             const uint32_t alt = PortApi::Crc32c(data_crc, desc, sizeof(desc));
-            if (PortApi::TextureOverrideHashKnown(alt)) {
+            if (PortApi::TextureHashHasSections(alt)) {
                 if (out_matched) *out_matched = true;
                 return alt;
             }
@@ -691,8 +691,8 @@ void DrainQueue()
                     if (ij.unskinned) {
                         auto prev = g_cache.find(ij.vb_va);
                         if (prev != g_cache.end() && prev->second.ib_base_va == ij.ib_base_va && prev->second.hash != 0) {
-                            const uint32_t merged_reach = std::max(prev->second.ib_reach, reach);
-                            const uint32_t merged_ib = std::max(prev->second.ib_bytes, ij.ib_bytes);
+                            const uint32_t merged_reach = (std::max)(prev->second.ib_reach, reach);
+                            const uint32_t merged_ib = (std::max)(prev->second.ib_bytes, ij.ib_bytes);
                             if (outs[s].matched || (!prev->second.matched && vbBytes >= prev->second.vb_bytes))
                                 StoreLocked(ij.vb_va,
                                     Cached{ outs[s].full, merged_ib, merged_reach, vbBytes, ij.ib_base_va,
