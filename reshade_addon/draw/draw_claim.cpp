@@ -280,7 +280,7 @@ std::string SmallMeshReport(uint32_t count)
 
 namespace {
 
-uint32_t LookupSmallFromDraw(const DrawArgs& da, uint32_t* out_vstride = nullptr)
+uint32_t LookupSmallFromDraw(const DrawArgs& da, uint32_t* out_vstride = nullptr, bool medium = false)
 {
     ID3D12Resource* ibr = nullptr;
     ID3D12Resource* vbr = nullptr;
@@ -301,11 +301,11 @@ uint32_t LookupSmallFromDraw(const DrawArgs& da, uint32_t* out_vstride = nullptr
     }
     const int64_t vb_off =
         !vbr ? -1 : (int64_t)(vbva - vbr->GetGPUVirtualAddress()) + (int64_t)da.vertex_offset * vstride;
-    const char* const refused = !ibr || !vbr || !vstride      ? "no buffers"
-        : (vstride & 3u) != 0 || vstride < 12 || vstride > 64 ? "non-position stride"
-        : da.instance_count > 4                               ? "instanced batch"
-        : vb_off < 0                                          ? "base vertex before the buffer"
-                                                              : nullptr;
+    const char* const refused = !ibr || !vbr || !vstride ? "no buffers"
+        : (vstride & 3u) != 0 || vstride > 128           ? "non-position stride"
+        : (medium && da.instance_count > 32)             ? "instanced batch"
+        : vb_off < 0                                     ? "base vertex before the buffer"
+                                                         : nullptr;
     if (out_vstride) *out_vstride = vstride;
     if (refused) {
 #ifdef WWMI_DEBUG
@@ -313,11 +313,9 @@ uint32_t LookupSmallFromDraw(const DrawArgs& da, uint32_t* out_vstride = nullptr
 #endif
         return 0;
     }
-    const uint32_t base_ib_off = (uint32_t)(ibva - ibr->GetGPUVirtualAddress());
-    const uint32_t ib_off = da.vertex_offset == 0 ? base_ib_off : base_ib_off + da.first_index * idxb;
-    const uint32_t ib_bytes =
-        da.vertex_offset == 0 ? (da.first_index + da.index_count) * idxb : da.index_count * idxb;
-    const uint32_t got = IbHash::LookupSmall(ibr, ib_off, ib_bytes, idxb, vbr, (uint32_t)vb_off, vstride);
+    const uint32_t ib_off = (uint32_t)(ibva - ibr->GetGPUVirtualAddress()) + da.first_index * idxb;
+    const uint32_t got =
+        IbHash::LookupSmall(ibr, ib_off, da.index_count * idxb, idxb, vbr, (uint32_t)vb_off, vstride, medium);
 #ifdef WWMI_DEBUG
     SmallMeshSeen(da, vbr, vbva, vstride, vsize, got ? "hash" : "pending or not hashed", got);
 #else
@@ -374,12 +372,11 @@ bool DispatchDrawnMeshOverrides(
 bool RunSmallMeshOverrides(const DrawArgs& da)
 {
     const bool menu_shape = g_settings.decensor && da.index_count == kMenuBackdropIndices;
-    const uint32_t min_idx = da.draw_rt.has_dsv ? 18u : 24u;
-    if (da.index_count < min_idx || da.index_count >= 256 ||
+    if (da.index_count < 3 || da.index_count >= 256 ||
         (!menu_shape && !g_recognition.SmallMeshAny() && !g_recognition.ModelHashAny()))
         return false;
     uint32_t vstride = 0;
-    const uint32_t got = LookupSmallFromDraw(da, &vstride);
+    const uint32_t got = LookupSmallFromDraw(da, &vstride, /*medium*/ false);
     if (!got) return false;
     if (g_recognition.ModelHashAny()) g_recognition.NoteModelDrawn(got);
     if (got == kMenuBackdropMesh) {
@@ -388,6 +385,58 @@ bool RunSmallMeshOverrides(const DrawArgs& da)
             logger::write("DECENSOR rests while the game draws its character menu (backdrop mesh %08x)", got);
     }
     return DispatchSmallMeshOverride(got, da, vstride);
+}
+
+bool RunIndirectMeshOverrides(
+    command_list* cmd_list, resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride)
+{
+    if (!cmd_list || !buffer.handle || !draw_count || (offset & 3u) != 0) return false;
+    uint64_t vs_hash = 0;
+    cmd_list->get_private_data(s_iid_vs_hash, &vs_hash);
+    if (!vs_hash) return false;
+    auto* d3d12_cl = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+    if (!d3d12_cl) return false;
+    ID3D12Resource* ibr = nullptr;
+    ID3D12Resource* vbr = nullptr;
+    uint64_t ibva = 0;
+    uint64_t vbva = 0;
+    uint32_t idxb = 2;
+    uint32_t vstride = 0;
+    {
+        const auto& st = g_command_lists.Gfx(cmd_list);
+        ibr = st.ib.res;
+        ibva = st.ib.va;
+        if (st.ib.index_bytes) idxb = st.ib.index_bytes;
+        vbr = st.vb[0].res;
+        vbva = st.vb[0].va;
+        vstride = st.vb[0].stride;
+    }
+    if (!ibr || !vbr || !vstride || (vstride & 3u) != 0 || vstride > 128) return false;
+    const uint64_t ib_base = ibr->GetGPUVirtualAddress();
+    const uint64_t vb_base = vbr->GetGPUVirtualAddress();
+    if (ibva < ib_base || vbva < vb_base) return false;
+    const uint32_t ib_off = (uint32_t)(ibva - ib_base);
+    const uint32_t vb_off = (uint32_t)(vbva - vb_base);
+    auto* args_res = reinterpret_cast<ID3D12Resource*>(buffer.handle);
+    const uint32_t step = stride ? stride : 20u;
+    const bool skip_any = g_recognition.SkipVbHashAny();
+    const bool model_any = g_recognition.ModelHashAny();
+    const uint32_t n = draw_count < 4u ? draw_count : 4u;
+    for (uint32_t k = 0; k < n; ++k) {
+        const uint64_t arg_off = offset + (uint64_t)k * step;
+        if ((arg_off & 3u) != 0) continue;
+        const uint32_t got = IbHash::LookupIndirect(ibr, ib_off, idxb, vbr, vb_off, vstride, args_res, arg_off);
+        if (!got) continue;
+        if (model_any) g_recognition.NoteModelDrawn(got);
+        PortApi::NextDrawCall();
+        struct PostAfterIndirect {
+            ~PostAfterIndirect() { PortApi::RunPendingPost(); }
+        } post_after;
+        DrawArgs da{ cmd_list, d3d12_cl, 0, 1, 0, 0, 0, vs_hash, g_command_lists.Rt(cmd_list) };
+        if (DispatchDrawnMeshOverrides(got, da, vstride, skip_any, /*log_drop*/ false, vs_hash) && draw_count == 1)
+            return true;
+    }
+    return false;
 }
 
 std::optional<bool> ClaimDraw(DrawContext& ctx)
@@ -514,10 +563,10 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                         }
                     }
                 }
-            } else if (!skinned && da.instance_count <= 2 &&
+            } else if (!skinned && index_count <= 48000 && da.instance_count <= 32 &&
                 (skip_any || (draw_rt.rtv_count > 0 && (model_any || small_any)))) {
                 uint32_t vstride = 0;
-                const uint32_t got = LookupSmallFromDraw(da, &vstride);
+                const uint32_t got = LookupSmallFromDraw(da, &vstride, /*medium*/ true);
                 if (got) {
                     if (model_any) g_recognition.NoteModelDrawn(got);
                     if (DispatchDrawnMeshOverrides(got, da, vstride, skip_any, /*log_drop*/ false, vs_hash))
@@ -653,6 +702,45 @@ std::optional<bool> ClaimDraw(DrawContext& ctx)
                     !has_ib_ref ? ", no hash= in the ini" : (ib_got == 0 ? ", NOT COMPUTED YET" : ", MISMATCH"),
                     has_ib_ref ? "skipped (the mod carries hash=)" : "probed and missed",
                     (unsigned long long)all_vb_va[6]);
+            if (!is_mod_char && !char_vb && !char_ibset && index_count >= 256 && (skip_any || model_any || small_any)) {
+                const bool slot_skinned = g_recognition.InSkinBand(vb0) || all_vb_va[6] != 0;
+                if (slot_skinned) {
+                    uint32_t got = ib_got;
+                    if (!got) {
+                        ID3D12Resource* ibr = nullptr;
+                        ID3D12Resource* vbr = nullptr;
+                        uint64_t ibva = 0;
+                        uint32_t idxb = 2;
+                        {
+                            const auto& st = g_command_lists.Gfx(cmd_list);
+                            ibr = st.ib.res;
+                            ibva = st.ib.va;
+                            if (st.ib.index_bytes) idxb = st.ib.index_bytes;
+                            vbr = st.vb[0].res;
+                        }
+                        if (ibr && vbr && all_vb_str[0]) {
+                            const uint32_t iboff = (uint32_t)(ibva - ibr->GetGPUVirtualAddress());
+                            const uint32_t vboff = (uint32_t)(vb0 - vbr->GetGPUVirtualAddress());
+                            got = IbHash::Lookup(
+                                ibr, iboff, (first_index + index_count) * idxb, idxb, vbr, vboff, all_vb_str[0], true);
+                        }
+                    }
+                    if (got) {
+                        if (model_any) g_recognition.NoteModelDrawn(got);
+                        if (DispatchDrawnMeshOverrides(got, da, all_vb_str[0], skip_any, /*log_drop*/ true, vs_hash))
+                            return true;
+                    }
+                } else if (index_count <= 48000 && da.instance_count <= 32 &&
+                    (skip_any || (draw_rt.rtv_count > 0 && (model_any || small_any)))) {
+                    uint32_t vstride = 0;
+                    const uint32_t got = LookupSmallFromDraw(da, &vstride, /*medium*/ true);
+                    if (got) {
+                        if (model_any) g_recognition.NoteModelDrawn(got);
+                        if (DispatchDrawnMeshOverrides(got, da, vstride, skip_any, /*log_drop*/ false, vs_hash))
+                            return true;
+                    }
+                }
+            }
             if (is_mod_char) {
                 const uint32_t sh = HashBoneCB(cur.res, cur.va);
                 if (vb0) g_recognition.NoteCharMeshVb0(vb0, CharVbOrigin{ g_frame_id, Mods().At(md).ns_hash }); // by THIS mod, now

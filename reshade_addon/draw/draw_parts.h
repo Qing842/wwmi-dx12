@@ -21,6 +21,10 @@ bool RunDrawShaderOverrides(const DrawArgs& da, std::optional<PortApi::EngineSco
 // A small unskinned draw whose vertex buffer hashes to a variable-only section runs it, as DX11's
 // `checktextureoverride = vb0` would; true = the section skips the draw (draw_claim.cpp).
 bool RunSmallMeshOverrides(const DrawArgs& da);
+// An ExecuteIndirect indexed draw (e.g. Niagara GPU mesh particles) whose vertex buffer hashes to a variable-only or
+// skip section runs it; true = the section skips the draw (draw_claim.cpp).
+bool RunIndirectMeshOverrides(reshade::api::command_list* cmd_list, reshade::api::resource buffer, uint64_t offset,
+    uint32_t draw_count, uint32_t stride);
 #ifdef WWMI_DEBUG
 // Every small draw RunSmallMeshOverrides saw, one line per vertex buffer; count = 0 for all (debug pipe `smallmesh`).
 std::string SmallMeshReport(uint32_t count);

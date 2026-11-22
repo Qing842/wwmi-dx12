@@ -218,6 +218,27 @@ static void on_present(command_queue* queue, swapchain* sc, const rect*, const r
     WWMI_GUARD_END_VOID()
 }
 
+static bool on_draw_indexed_indirect_guarded(
+    command_list* cmd_list, resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride)
+{
+    WWMI_GUARD_BEGIN("on_draw_indexed_indirect")
+    return on_draw_indexed_indirect_body(cmd_list, buffer, offset, draw_count, stride);
+    WWMI_GUARD_END(false)
+}
+
+static bool on_draw_or_dispatch_indirect(command_list* cmd_list, indirect_command type, resource buffer,
+    uint64_t offset, uint32_t draw_count, uint32_t stride)
+{
+    if (type != indirect_command::draw_indexed || g_addon.disabled || g_addon.faulted || !g_addon.is_dx12)
+        return false;
+    if (!draw_count || !buffer.handle) return false;
+    if (!g_recognition.SmallMeshAny() && !g_recognition.ModelHashAny() && !g_recognition.SkipVbHashAny())
+        return false;
+    g_command_lists.NoteDraw(cmd_list);
+    ModSetScope set_scope(cmd_list);
+    return on_draw_indexed_indirect_guarded(cmd_list, buffer, offset, draw_count, stride);
+}
+
 // Our folders under the game's: the mod tree (wwmi_dir from the ini), the data and cache directories.
 static void SetupDirectories()
 {
@@ -333,6 +354,7 @@ static void RegisterEvents()
     reshade::register_event<reshade::addon_event::bind_scissor_rects>(OWN_DEVICE(HP(bind_scissor_rects)));
     reshade::register_event<reshade::addon_event::bind_pipeline_states>(OWN_DEVICE(HP(bind_pipeline_states)));
     reshade::register_event<reshade::addon_event::draw_indexed>(OWN_DEVICE(HP(draw_indexed)));
+    reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OWN_DEVICE(&on_draw_or_dispatch_indirect));
 #ifdef WWMI_DEBUG
     reshade::register_event<reshade::addon_event::draw>(OWN_DEVICE(&on_draw));
 #endif

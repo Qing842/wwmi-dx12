@@ -141,3 +141,9 @@ bool on_draw_indexed_body(command_list* cmd_list, uint32_t index_count, uint32_t
 
     return InjectClaimedDraw(ctx);
 }
+
+bool on_draw_indexed_indirect_body(
+    command_list* cmd_list, resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride)
+{
+    return RunIndirectMeshOverrides(cmd_list, buffer, offset, draw_count, stride);
+}
