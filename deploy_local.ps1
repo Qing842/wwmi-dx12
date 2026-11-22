@@ -61,4 +61,19 @@ if (-not $LauncherOnly -and [IO.Directory]::Exists($csoSrcDir)) {
     }
 }
 
+if (-not $LauncherOnly) {
+    $matchesDstDir = [IO.Path]::Combine($GameWin64, "wwmi_dx12\texture_matches")
+    [void][IO.Directory]::CreateDirectory($matchesDstDir)
+    $seedPairs = @(
+        @{ Src = [IO.Path]::Combine($PSScriptRoot, "package\wwmi_dx12_seed.lodcache"); Dst = [IO.Path]::Combine($matchesDstDir, "lods.lodcache") },
+        @{ Src = [IO.Path]::Combine($PSScriptRoot, "package\wwmi_dx12_seed.texlook");  Dst = [IO.Path]::Combine($matchesDstDir, "looks.texlook") }
+    )
+    foreach ($sp in $seedPairs) {
+        if ([IO.File]::Exists($sp.Src)) {
+            [IO.File]::Copy($sp.Src, $sp.Dst, $true)
+            Write-Host "Deployed texture match seed: $($sp.Dst)"
+        }
+    }
+}
+
 Write-Host "Deployment complete (preserved wwmi_dx12.ini and wwmi_dx12\cache\)."

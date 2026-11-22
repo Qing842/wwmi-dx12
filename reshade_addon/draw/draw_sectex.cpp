@@ -73,7 +73,6 @@ static bool ForEachPsTexture(command_list* cmd_list, bool unread, const DxilSrvR
 
 void SectionTexturePublisher::CarryPsReads(const DrawArgs& da)
 {
-    if (!Mods().PsSlotQueries()) return;
     command_list* const cmd_list = da.cmd_list;
     CmdState& gs = g_command_lists.Gfx(cmd_list);
     if (!g_recognition.InSkinBand(gs.vb[0].va)) return;
@@ -191,7 +190,6 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
     uint64_t ps_hash = 0;
     cmd_list->get_private_data(s_iid_ps_hash, &ps_hash);
     const uint64_t pass = TexLookPlaceOf(Mods().At(dm).wcl_ns.c_str(), comp, ps_hash);
-    const bool every_slot = Mods().At(dm).mod.queries_ps_slots;
     const auto& rule_targets = g_tex_rules.Now().targets;
     device* dev = cmd_list->get_device();
     ForEachPsTexture(
@@ -209,9 +207,9 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
             }
             const uint32_t hash = ResolveSectionTexHash(resident);
             const bool known = hash && PortApi::TextureHashHasSections(hash);
-            if (!known && !(every_slot && read)) return;
+            if (!known && !read) return;
             if (read) {
-                const unsigned fmt = every_slot && ri.view_handle
+                const unsigned fmt = ri.view_handle
                     ? (unsigned)dev->get_resource_view_desc(resource_view{ ri.view_handle }).format
                     : 0u;
                 PortApi::PushGameTexture('p', r, ri.res, known ? hash : resident, fmt);
@@ -242,14 +240,14 @@ uint16_t SectionTexturePublisher::Publish(command_list* cmd_list, int dm, int co
                 }
             }
         });
-    if (every_slot) pushed |= PublishCarried(cmd_list, dm, comp, ps_regs, pushed, ps_hash);
+    pushed |= PublishCarried(cmd_list, dm, comp, ps_regs, pushed, ps_hash);
     return pushed;
 }
 
 #ifdef WWMI_DEBUG
 void SectionTexturePublisher::NoteRefTextures(const DrawArgs& da)
 {
-    if (!g_tex_ref_take.Collecting()) return;
+    if (!g_tex_ref_take.Watching()) return;
     command_list* const cmd_list = da.cmd_list;
     {
         const auto& st = g_command_lists.Gfx(cmd_list);
@@ -258,6 +256,14 @@ void SectionTexturePublisher::NoteRefTextures(const DrawArgs& da)
     ForEachPsTexture(
         cmd_list, false, g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p'), [](unsigned) { return true; },
         [](const PsTexture& t) { g_tex_ref_take.Note(t.ri.res); });
+}
+
+void SectionTexturePublisher::NoteNamedRefTextures(command_list* cmd_list)
+{
+    if (!g_tex_ref_take.Watching()) return;
+    ForEachPsTexture(
+        cmd_list, false, g_pipelines.SrvRegs(g_command_lists.Gfx(cmd_list).gfx_pso, 'p'), [](unsigned) { return true; },
+        [](const PsTexture& t) { g_tex_ref_take.NoteNamed(t.ri.res); });
 }
 
 TexDrawWatch g_tex_draw_watch;
