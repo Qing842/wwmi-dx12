@@ -3,6 +3,9 @@
 #include "globals.h"
 #include "IniHandler.h"
 #include "CommandList.h"
+#include "ResourceHash.h"
+#include "ShaderRegex.h"
+#include "dx12_context.h"
 #include "dx12_wrap.h"
 #include "dx12_pipeline.h"
 #include "command_observer.h"
@@ -444,7 +447,43 @@ bool SwapTextureResource(const wchar_t* fq_name, ID3D11Resource* was, ID3D11Reso
     return true;
 }
 
-// This ini load's resource copies, unwrapped and out of the optimiser's batches, under the engine lock.
+static void CollectResourceCopyOp(ResourceCopyOperation* op, std::vector<ResourceCopyOperation*>& out,
+    std::unordered_set<const void*>& seen_ops)
+{
+    if (!op || !seen_ops.insert(op).second) return;
+    out.push_back(op);
+    if (auto* cond = dynamic_cast<ConditionalSlotCopyOperation*>(op)) {
+        for (const ConditionalSlotBranch& br : cond->branches)
+            if (br.op) CollectResourceCopyOp(br.op.get(), out, seen_ops);
+    }
+}
+
+static void CollectResourceCopiesFromList(CommandList* cl, std::vector<ResourceCopyOperation*>& out,
+    std::unordered_set<const CommandList*>& seen_lists, std::unordered_set<const void*>& seen_ops)
+{
+    if (!cl || !seen_lists.insert(cl).second) return;
+    if (CommandList* resolved = cl->ResolveCommandList(); resolved && resolved != cl)
+        CollectResourceCopiesFromList(resolved, out, seen_lists, seen_ops);
+    for (const auto& c : cl->commands) {
+        CommandListCommand* cmd = MigotoPort::g_command_observer.Unwrap(c.get());
+        if (!cmd) continue;
+        if (auto* ic = dynamic_cast<IfCommand*>(cmd)) {
+            CollectResourceCopiesFromList(ic->true_commands_pre.get(), out, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(ic->true_commands_post.get(), out, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(ic->false_commands_pre.get(), out, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(ic->false_commands_post.get(), out, seen_lists, seen_ops);
+            continue;
+        }
+        if (auto* batch = dynamic_cast<ShaderResourceBatch*>(cmd)) {
+            for (const auto& o : batch->operations) CollectResourceCopyOp(o.get(), out, seen_ops);
+            continue;
+        }
+        if (auto* op = dynamic_cast<ResourceCopyOperation*>(cmd)) CollectResourceCopyOp(op, out, seen_ops);
+    }
+}
+
+// This ini load's resource copies across all live command-list trees (optimise_command_lists clears
+// registered_command_lists at load end), unwrapped and out of batches/branches, under the engine lock.
 static const std::vector<ResourceCopyOperation*>& ResourceCopies()
 {
     static std::vector<ResourceCopyOperation*> s_ops;
@@ -452,14 +491,49 @@ static const std::vector<ResourceCopyOperation*>& ResourceCopies()
     if (s_gen != g_generation) {
         s_gen = g_generation;
         s_ops.clear();
-        for (CommandList* cl : registered_command_lists)
-            for (const auto& c : cl->commands) {
-                CommandListCommand* cmd = MigotoPort::g_command_observer.Unwrap(c.get());
-                if (auto* op = dynamic_cast<ResourceCopyOperation*>(cmd))
-                    s_ops.push_back(op);
-                else if (auto* batch = dynamic_cast<ShaderResourceBatch*>(cmd))
-                    for (const auto& o : batch->operations) s_ops.push_back(o.get());
+        std::unordered_set<const CommandList*> seen_lists;
+        std::unordered_set<const void*> seen_ops;
+        if (G) {
+            CollectResourceCopiesFromList(&G->present_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->post_present_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->constants_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->post_constants_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->clear_rtv_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->post_clear_rtv_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->clear_dsv_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->post_clear_dsv_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->clear_uav_float_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->post_clear_uav_float_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->clear_uav_uint_command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&G->post_clear_uav_uint_command_list, s_ops, seen_lists, seen_ops);
+            for (auto& kv : G->mShaderOverrideMap) {
+                CollectResourceCopiesFromList(&kv.second.command_list, s_ops, seen_lists, seen_ops);
+                CollectResourceCopiesFromList(&kv.second.post_command_list, s_ops, seen_lists, seen_ops);
             }
+            for (auto& kv : G->mTextureOverrideMap)
+                for (TextureOverride& to : kv.second) {
+                    CollectResourceCopiesFromList(&to.command_list, s_ops, seen_lists, seen_ops);
+                    CollectResourceCopiesFromList(&to.post_command_list, s_ops, seen_lists, seen_ops);
+                }
+            for (const auto& tof : G->mFuzzyTextureOverrides)
+                if (tof && tof->texture_override) {
+                    CollectResourceCopiesFromList(&tof->texture_override->command_list, s_ops, seen_lists, seen_ops);
+                    CollectResourceCopiesFromList(
+                        &tof->texture_override->post_command_list, s_ops, seen_lists, seen_ops);
+                }
+        }
+        for (auto& kv : shader_regex_groups) {
+            CollectResourceCopiesFromList(&kv.second.command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&kv.second.post_command_list, s_ops, seen_lists, seen_ops);
+        }
+        for (auto& kv : customShaders) {
+            CollectResourceCopiesFromList(&kv.second.command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&kv.second.post_command_list, s_ops, seen_lists, seen_ops);
+        }
+        for (auto& kv : explicitCommandListSections) {
+            CollectResourceCopiesFromList(&kv.second.command_list, s_ops, seen_lists, seen_ops);
+            CollectResourceCopiesFromList(&kv.second.post_command_list, s_ops, seen_lists, seen_ops);
+        }
     }
     return s_ops;
 }
@@ -491,6 +565,24 @@ void ReleaseOldTextures(const std::unordered_map<ID3D11Resource*, ID3D11Resource
         op->cached_view->Release();
         op->cached_view = nullptr;
     }
+    auto holds_old = [&](ID3D11View* v) {
+        if (!v) return false;
+        ID3D11Resource* res = nullptr;
+        v->GetResource(&res);
+        if (!res) return false;
+        const bool old = old_to_new.count(res) != 0;
+        res->Release();
+        return old;
+    };
+    MigotoPort::PipeState& pst = MigotoPort::State();
+    for (unsigned si = 0; si < MigotoPort::kStages; ++si)
+        for (unsigned slot = 0; slot < MigotoPort::kMaxSRV; ++slot)
+            if (holds_old(pst.srv[si][slot])) MigotoPort::BindSlot(pst.srv[si][slot], (ID3D11ShaderResourceView*)nullptr);
+    for (unsigned u = 0; u < MigotoPort::kMaxUAV; ++u)
+        if (holds_old(pst.uav[u])) MigotoPort::BindSlot(pst.uav[u], (ID3D11UnorderedAccessView*)nullptr);
+    for (unsigned rt = 0; rt < MigotoPort::kMaxRTV; ++rt)
+        if (holds_old(pst.rtv[rt])) MigotoPort::BindSlot(pst.rtv[rt], (ID3D11RenderTargetView*)nullptr);
+    if (holds_old(pst.dsv)) MigotoPort::BindSlot(pst.dsv, (ID3D11DepthStencilView*)nullptr);
 }
 
 std::unordered_set<ID3D11Resource*> HeldByRef(const std::vector<std::pair<std::wstring, ID3D11Resource*>>& textures)

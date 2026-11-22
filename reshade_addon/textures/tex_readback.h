@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // A texture whose bytes never passed an upload hook: its mip0 copied to a readback buffer, hashed frames later.
@@ -17,6 +19,7 @@ public:
     bool ScheduleUpload(ID3D12Device* dev, reshade::api::command_list* list, ID3D12GraphicsCommandList* cl,
         ID3D12Resource* src, uint64_t src_off, uint64_t bytes, ID3D12Resource* dst, uint32_t sub,
         const uint32_t* cpu_crc);
+    bool HasPendingMip0(ID3D12Resource* dst);
     // A game list submitted: the readbacks recorded on it are timed by a fence signalled behind it.
     void OnExecute(reshade::api::command_queue* queue, reshade::api::command_list* list);
     void Drain(); // once per present: what the graphics card has copied, hashed
@@ -31,6 +34,7 @@ private:
         ID3D12CommandQueue* queue = nullptr;
         Microsoft::WRL::ComPtr<ID3D12Fence> fence;
         uint64_t next = 0;
+        ULONGLONG last_exec_ms = 0;
     };
     struct Pending {
         ID3D12Resource* dst = nullptr;
@@ -52,8 +56,15 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> buf;
         uint64_t bytes = 0;
     };
+    struct RetiringSpare {
+        Microsoft::WRL::ComPtr<ID3D12Resource> buf;
+        std::vector<std::pair<QueueFence*, uint64_t>> gates;
+    };
     bool Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending& p, ID3D12Resource** buf);
     void KeepSpare(Microsoft::WRL::ComPtr<ID3D12Resource> b);
+    void RetireSparesLocked();
+    void SweepRetiringLocked();
+    void DropPendingMip0Locked(ID3D12Resource* dst);
     static void Arrived(const Pending& p, const uint8_t* data);
     QueueFence* FenceOf(ID3D12CommandQueue* q);
     template <class Behind> unsigned SignalBehind(QueueFence* qf, Behind behind);
@@ -63,9 +74,11 @@ private:
     uint32_t cursor_ = 0; // the shared buffer is free from here; back to 0 once no copy into it is outstanding
     std::vector<Pending> pending_;
     std::vector<Spare> spare_; // own buffers whose readback was hashed or dropped, for the next that does not fit
-    ULONGLONG own_used_ms_ = 0; // when an own buffer was last taken; the spares go after 10 s without one
+    std::vector<RetiringSpare> retiring_; // spares fenced across queues before Release
+    ULONGLONG own_used_ms_ = 0; // when an own buffer was last taken or returned; spares retire after 10 s idle
     std::deque<QueueFence> fences_; // one per queue: queues finish out of order
     std::atomic<uint32_t> unsignalled_{ 0 }; // pending_ entries with no signal behind them yet
+    std::unordered_map<ID3D12Resource*, uint32_t> pending_mip0_;
     std::unordered_set<ID3D12Resource*> tried_;
     std::mutex mtx_;
 };

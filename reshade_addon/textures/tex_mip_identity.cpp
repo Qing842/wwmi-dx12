@@ -82,6 +82,9 @@ std::vector<std::pair<uint32_t, uint32_t>> TexMipIdentity::TakeFed(uint64_t dest
 void TexMipIdentity::FromUpload(ID3D12Resource* dest, uint32_t sub, const uint8_t* src)
 {
     if (!dest || !src || sub == 0 || !g_tex_rules.Ready() || !g_settings.texlod_cache) return;
+    const uint32_t h0_known = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(dest));
+    if (h0_known && !g_tex_select.ProvenRuleFor(h0_known) && !g_tex_crawl.On() && !g_tex_toggles.dump_degenerates)
+        return;
     const D3D12_RESOURCE_DESC d = dest->GetDesc();
     TexAssetLayout L;
     if (!TexAssetLayoutOf(d, sub, L) || !L.floor) return;

@@ -414,12 +414,15 @@ static void EnableDebugLayer()
     }
 }
 
-// The game's Engine.ini: full-resolution textures and streaming cvars, written only where they differ.
+// The game's Engine.ini: bounded texture streaming cvars, written only where they differ.
 static void ApplyEngineCvars()
 {
     std::wstring eng = s_win64 + L"..\\..\\Saved\\Config\\WindowsNoEditor\\Engine.ini";
-    const wchar_t* cvars[][2] = { { L"r.Streaming.FullyLoadUsedTextures", L"1" }, { L"r.MipMapLODBias", L"-1" },
-        { L"r.Streaming.Boost", L"30" }, { L"r.Streaming.MinBoost", L"30" }, { L"r.Streaming.HLODStrategy", L"2" } };
+    const wchar_t* cvars[][2] = { { L"r.TextureStreaming", L"1" }, { L"r.Streaming.FullyLoadUsedTextures", L"0" },
+        { L"r.Streaming.UseAllMips", L"0" }, { L"r.Streaming.PoolSize", L"2048" },
+        { L"r.Streaming.LimitPoolSizeToVRAM", L"1" }, { L"r.Streaming.MaxTempMemoryAllowed", L"128" },
+        { L"r.Streaming.Boost", L"1" }, { L"r.Streaming.MinBoost", L"1" }, { L"r.Streaming.HLODStrategy", L"0" },
+        { L"r.MipMapLODBias", L"0" } };
     unsigned written = 0;
     bool failed = false;
     for (const auto& kv : cvars) {
@@ -431,7 +434,7 @@ static void ApplyEngineCvars()
         else
             failed = true;
     }
-    ::logger::write("Config: Engine.ini full-res + streaming cvars %s (%u written) (%S)",
+    ::logger::write("Config: Engine.ini streaming cvars %s (%u written) (%S)",
         failed        ? "FAILED"
             : written ? "applied"
                       : "already set",

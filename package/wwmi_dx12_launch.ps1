@@ -269,6 +269,7 @@ $engineCvars = [ordered]@{
     "r.Streaming.FullyLoadUsedTextures" = "0"
     "r.Streaming.UseAllMips"            = "0"
     "r.Streaming.PoolSize"              = "2048"
+    "r.Streaming.LimitPoolSizeToVRAM"   = "1"
     "r.Streaming.MaxTempMemoryAllowed"  = "128"
     "r.Streaming.FramesForFullUpdate"   = "2"
     "r.Streaming.Boost"                 = "1"

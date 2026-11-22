@@ -1,5 +1,8 @@
 // The readback: a texture whose bytes never passed an upload hook, hashed from a GPU copy. See tex_readback.h.
 #include "tex_readback.h"
+#include "tex_identity.h"
+#include "tex_select.h"
+#include "tex_crawl.h"
 #include "tex_upload_identity.h"
 #include "tex_mip_identity.h"
 #include "tex_toggles.h"
@@ -74,15 +77,65 @@ bool TexReadback::Reserve(ID3D12Device* dev, uint64_t total, bool once, Pending&
     *buf = p.own ? p.own.Get() : rb_.Get();
     pending_.push_back(p);
     unsignalled_.fetch_add(1, std::memory_order_relaxed);
+    if (p.sub == 0) ++pending_mip0_[p.dst];
     if (once) tried_.insert(p.dst);
     return true;
+}
+
+bool TexReadback::HasPendingMip0(ID3D12Resource* dst)
+{
+    if (!dst) return false;
+    std::lock_guard l(mtx_);
+    return pending_mip0_.find(dst) != pending_mip0_.end();
+}
+
+void TexReadback::DropPendingMip0Locked(ID3D12Resource* dst)
+{
+    auto it = pending_mip0_.find(dst);
+    if (it != pending_mip0_.end() && --it->second == 0) pending_mip0_.erase(it);
 }
 
 void TexReadback::KeepSpare(ComPtr<ID3D12Resource> b)
 {
     if (!b) return;
+    own_used_ms_ = GetTickCount64();
     const uint64_t bytes = b->GetDesc().Width;
     spare_.push_back(Spare{ std::move(b), bytes });
+}
+
+void TexReadback::RetireSparesLocked()
+{
+    if (spare_.empty()) return;
+    std::vector<std::pair<QueueFence*, uint64_t>> gates;
+    gates.reserve(fences_.size());
+    for (QueueFence& f : fences_) {
+        if (!f.queue || !f.fence) continue;
+        if (FAILED(f.queue->Signal(f.fence.Get(), f.next + 1))) return;
+        ++f.next;
+        gates.emplace_back(&f, f.next);
+    }
+    for (Spare& s : spare_) retiring_.push_back(RetiringSpare{ std::move(s.buf), gates });
+    spare_.clear();
+}
+
+void TexReadback::SweepRetiringLocked()
+{
+    size_t keep = 0;
+    for (size_t i = 0; i < retiring_.size(); ++i) {
+        bool done = true;
+        for (const auto& [qf, val] : retiring_[i].gates) {
+            const UINT64 cur = qf->fence->GetCompletedValue();
+            if (cur != UINT64_MAX && cur < val) {
+                done = false;
+                break;
+            }
+        }
+        if (!done) {
+            if (keep != i) retiring_[keep] = std::move(retiring_[i]);
+            ++keep;
+        }
+    }
+    retiring_.erase(retiring_.begin() + (ptrdiff_t)keep, retiring_.end());
 }
 
 bool TexReadback::Schedule(ID3D12Device* dev, command_list* list, ID3D12GraphicsCommandList* cl, ID3D12Resource* src,
@@ -184,21 +237,38 @@ template <class Behind> unsigned TexReadback::SignalBehind(QueueFence* qf, Behin
 
 void TexReadback::OnExecute(command_queue* queue, command_list* list)
 {
-    if (!queue || !list || unsignalled_.load(std::memory_order_relaxed) == 0) return;
+    if (!queue || !list) return;
     auto* const q = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
+    if (unsignalled_.load(std::memory_order_relaxed) == 0) return;
     const uint32_t tid = GetCurrentThreadId();
     const uint64_t gen = g_command_lists.Gen(list);
+    const ULONGLONG now = GetTickCount64();
     std::lock_guard l(mtx_);
-    for (QueueFence& f : fences_)
-        if (f.queue == q) SignalBehind(&f, [&](const Pending& p) { return p.tid == tid && p.resets != t_list_resets; });
+    for (QueueFence& f : fences_) {
+        if (f.queue == q) {
+            f.last_exec_ms = now;
+            SignalBehind(&f, [&](const Pending& p) {
+                return p.exec_ms != 0 &&
+                    ((p.tid == tid && p.resets != t_list_resets) || p.list == list ||
+                        g_command_lists.Gen(p.list) != p.gen);
+            });
+        }
+    }
     for (Pending& p : pending_)
         if (!p.exec_ms && p.list == list && p.gen == gen) {
             p.qf = FenceOf(q);
+            if (p.qf) p.qf->last_exec_ms = now;
             p.tid = tid;
             p.resets = t_list_resets;
-            p.exec_ms = GetTickCount64();
+            p.exec_ms = now ? now : 1;
             if (!p.qf) unsignalled_.fetch_sub(1, std::memory_order_relaxed);
         }
+}
+
+static bool ReadbackMipWanted(ID3D12Resource* dst)
+{
+    const uint32_t h0 = g_tex_identity.HashOf(reinterpret_cast<uint64_t>(dst));
+    return !h0 || g_tex_select.ProvenRuleFor(h0) != 0 || g_tex_crawl.On() || g_tex_toggles.dump_degenerates;
 }
 
 void TexReadback::Drain()
@@ -222,21 +292,30 @@ void TexReadback::Drain()
     {
         std::lock_guard l(mtx_);
         const ULONGLONG now = GetTickCount64();
-        for (QueueFence& f : fences_)
-            g_tex_stats.ts_rb_late.fetch_add(
-                SignalBehind(&f, [&](const Pending& p) { return now - p.exec_ms >= 1000; }), std::memory_order_relaxed);
+        for (QueueFence& f : fences_) {
+            SignalBehind(&f, [&](const Pending& p) {
+                return p.exec_ms != 0 && g_command_lists.Gen(p.list) != p.gen;
+            });
+            if (now - f.last_exec_ms >= 250)
+                g_tex_stats.ts_rb_late.fetch_add(
+                    SignalBehind(&f, [&](const Pending& p) { return p.exec_ms != 0 && now - p.exec_ms >= 2500; }),
+                    std::memory_order_relaxed);
+        }
         size_t keep = 0;
         for (size_t i = 0; i < pending_.size(); ++i) {
             Pending& p = pending_[i];
             const bool dropped = !p.exec_ms && g_command_lists.Gen(p.list) != p.gen;
-            const bool ran =
-                p.value ? p.qf->fence->GetCompletedValue() >= p.value : (p.exec_ms && !p.qf && now - p.exec_ms >= 2000);
+            const bool ran = p.value ? p.qf->fence->GetCompletedValue() >= p.value
+                                     : (p.exec_ms && !p.qf && now - p.exec_ms >= 3000);
             if (!dropped && !ran) {
                 if (keep != i) pending_[keep] = std::move(p);
                 ++keep;
                 continue;
             }
-            if (dropped) unsignalled_.fetch_sub(1, std::memory_order_relaxed);
+            if (dropped) {
+                unsignalled_.fetch_sub(1, std::memory_order_relaxed);
+                if (p.sub == 0) DropPendingMip0Locked(p.dst);
+            }
             if (ran) {
                 arrived.push_back(std::move(p));
             } else {
@@ -249,6 +328,7 @@ void TexReadback::Drain()
     }
     void* shared = nullptr;
     for (const Pending& p : arrived) {
+        if (p.sub != 0 && !p.compare && !ReadbackMipWanted(p.dst)) continue;
         if (p.own) {
             void* q = nullptr;
             if (SUCCEEDED(p.own->Map(0, nullptr, &q)) && q) {
@@ -270,8 +350,12 @@ void TexReadback::Drain()
     }
     {
         std::lock_guard l(mtx_);
-        for (Pending& p : arrived) KeepSpare(std::move(p.own));
-        if (!spare_.empty() && GetTickCount64() - own_used_ms_ >= 10000) spare_.clear();
+        for (Pending& p : arrived) {
+            if (p.sub == 0) DropPendingMip0Locked(p.dst);
+            KeepSpare(std::move(p.own));
+        }
+        if (!spare_.empty() && GetTickCount64() - own_used_ms_ >= 10000) RetireSparesLocked();
+        SweepRetiringLocked();
         if (std::none_of(pending_.begin(), pending_.end(), [](const Pending& p) { return !p.own; })) cursor_ = 0;
     }
     for (const Pending& p : arrived) p.dst->Release();

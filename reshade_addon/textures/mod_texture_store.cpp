@@ -16,13 +16,27 @@ ModTextureStore g_mod_textures;
 
 void ModTextureStore::Table::put_key(uint64_t k, uint32_t index)
 {
+    uint32_t first_gone = icap;
     for (uint32_t i = slot(k), n = 0; n < icap; ++n, i = (i + 1) & (icap - 1)) {
         const uint64_t was = key[i].load(std::memory_order_acquire);
-        if (was == k || was == 0) {
+        if (was == k) {
             val[i].store(index, std::memory_order_release);
-            key[i].store(k, std::memory_order_release); // publish the key LAST
             return;
         }
+        if (was == kGone) {
+            if (first_gone == icap) first_gone = i;
+            continue;
+        }
+        if (was == 0) {
+            const uint32_t at = first_gone != icap ? first_gone : i;
+            val[at].store(index, std::memory_order_release);
+            key[at].store(k, std::memory_order_release); // publish the key LAST
+            return;
+        }
+    }
+    if (first_gone != icap) {
+        val[first_gone].store(index, std::memory_order_release);
+        key[first_gone].store(k, std::memory_order_release);
     }
 }
 
